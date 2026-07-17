@@ -1,0 +1,31 @@
+.DS_Store
+.margin-library.lock
+.margin-course-transactions/
+.build/
+.cache/
+Margin.app/
+dist/
+node_modules/
+*.log
+
+# The checkout may also be used as a local learning library. Ignore every
+# top-level directory unless it is an explicit source directory, so a newly
+# created private course cannot be staged accidentally.
+/*/
+!/.agents/
+!/.github/
+!/app/
+!/docs/
+!/examples/
+!/native/
+!/scripts/
+
+# Private learner state is never application source, including inside fixtures.
+**/.learn/
+
+# Local editor and environment state.
+.env
+.env.*
+skills-lock.json
+.idea/
+.vscode/

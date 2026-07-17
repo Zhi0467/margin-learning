@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "chapters": [
+    {
+      "id": "foundations",
+      "title": "Foundations",
+      "description": "Notice color relationships before naming them.",
+      "lectures": [
+        "lessons/0001-color-has-neighbors.html"
+      ]
+    }
+  ]
+}

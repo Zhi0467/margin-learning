@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="30" stdDeviation="34" flood-color="#6F2415" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="214" fill="#9A341F"/>
+  <g filter="url(#shadow)">
+    <path d="M238 212h490c44 0 80 36 80 80v440c0 44-36 80-80 80H238c-44 0-80-36-80-80V292c0-44 36-80 80-80Z" fill="#FFFDF7"/>
+    <path d="M652 212h76c44 0 80 36 80 80v440c0 44-36 80-80 80h-76V212Z" fill="#F6E8E2"/>
+    <rect x="617" y="212" width="14" height="600" rx="7" fill="#9A341F" opacity="0.22"/>
+    <rect x="256" y="334" width="278" height="26" rx="13" fill="#24211D" opacity="0.78"/>
+    <rect x="256" y="401" width="310" height="20" rx="10" fill="#24211D" opacity="0.25"/>
+    <rect x="256" y="458" width="260" height="20" rx="10" fill="#24211D" opacity="0.25"/>
+    <path d="M236 522h396v82H236c-22 0-40-18-40-40v-2c0-22 18-40 40-40Z" fill="#E8C86A"/>
+    <rect x="256" y="552" width="328" height="20" rx="10" fill="#24211D" opacity="0.76"/>
+    <path d="M681 508h97c29 0 52 23 52 52v16c0 29-23 52-52 52h-42l-32 35v-35h-23c-29 0-52-23-52-52v-16c0-29 23-52 52-52Z" fill="#136F63"/>
+    <circle cx="707" cy="568" r="8" fill="#FFFDF7"/>
+    <circle cx="731" cy="568" r="8" fill="#FFFDF7"/>
+    <circle cx="755" cy="568" r="8" fill="#FFFDF7"/>
+    <rect x="256" y="665" width="296" height="20" rx="10" fill="#24211D" opacity="0.25"/>
+  </g>
+</svg>

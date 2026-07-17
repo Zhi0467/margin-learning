@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Margin</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <section class="library-view" id="library-view" data-ready="false">
+    <header class="library-brand">
+      <span class="brand-mark" aria-hidden="true">M</span>
+      <h1>Margin</h1>
+    </header>
+    <main class="library-main">
+      <h2>Choose a course</h2>
+      <div class="course-shelf" id="course-shelf"></div>
+    </main>
+  </section>
+
+  <dialog class="new-course-dialog" id="new-course-dialog" aria-labelledby="new-course-title"
+    aria-describedby="new-course-intro">
+    <form class="new-course-form" id="new-course-form" aria-busy="false">
+      <div class="new-course-heading">
+        <span class="new-course-mark" aria-hidden="true">+</span>
+        <div>
+          <h2 id="new-course-title">New course</h2>
+          <p id="new-course-intro">Choose the subject and brief your teacher. Margin will create the course only after lecture 1 is ready.</p>
+        </div>
+      </div>
+
+      <label for="new-course-name">Course title</label>
+      <input id="new-course-name" name="title" type="text" maxlength="120" autocomplete="off"
+        placeholder="e.g. Probability for machine learning" required>
+
+      <label for="new-course-request">Initial teaching request <span>Shapes lecture 1</span></label>
+      <textarea id="new-course-request" name="initialRequest" rows="4" maxlength="1200"
+        aria-describedby="new-course-request-hint"
+        placeholder="What should the first lecture help you understand, and what background should the teacher assume?" required></textarea>
+      <p id="new-course-request-hint" class="new-course-field-hint">Required. This is the brief your teacher will use to shape the first lecture.</p>
+
+      <fieldset class="new-course-teacher-slip" id="new-course-teacher-slip">
+        <legend>Teacher for lecture 1</legend>
+        <div class="new-course-teacher-fields">
+          <label for="new-course-teacher-select">
+            <span>Teacher</span>
+            <select id="new-course-teacher-select" name="provider"></select>
+          </label>
+          <label for="new-course-model-select">
+            <span>Model</span>
+            <select id="new-course-model-select" name="model" aria-describedby="new-course-config-hint"></select>
+          </label>
+          <label for="new-course-effort-select">
+            <span>Thinking effort</span>
+            <select id="new-course-effort-select" name="effort" aria-describedby="new-course-config-hint"></select>
+          </label>
+        </div>
+        <div class="new-course-teacher-meta">
+          <p id="new-course-teacher-status"></p>
+          <p id="new-course-config-hint"></p>
+        </div>
+      </fieldset>
+
+      <div id="new-course-progress" class="new-course-progress" data-state="running" role="status"
+        aria-live="polite" aria-atomic="true" tabindex="-1" hidden>
+        <span class="new-course-progress-spinner" aria-hidden="true"></span>
+        <div class="new-course-progress-copy">
+          <strong id="new-course-progress-title">Preparing lecture 1</strong>
+          <p id="new-course-progress-activity">Starting the teacher…</p>
+          <progress aria-label="First lecture creation is in progress"></progress>
+        </div>
+      </div>
+
+      <div class="new-course-actions">
+        <button id="cancel-new-course" class="secondary-button" type="button">Cancel</button>
+        <button id="create-new-course" class="primary-button" type="submit">Create first lecture</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="app-shell" id="app" data-ready="false" data-left-collapsed="false" data-right-collapsed="false" hidden>
+    <aside class="course-rail" id="course-rail" aria-label="Course navigation">
+      <div class="panel-scale-content" id="course-panel-content">
+        <header class="brand">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <strong>Margin</strong>
+        </header>
+
+        <button class="back-to-library" id="back-to-library" type="button">← All courses</button>
+        <h2 class="current-course-title" id="current-course-title"></h2>
+
+        <nav class="course-nav" aria-label="Chapters and lectures">
+          <div class="rail-heading">
+            <span>Contents</span>
+          </div>
+          <div id="chapter-list" class="chapter-list"></div>
+        </nav>
+
+        <nav class="reference-nav" aria-label="References">
+          <div class="rail-heading"><span>Reference</span></div>
+          <div id="reference-list" class="reference-list"></div>
+        </nav>
+      </div>
+    </aside>
+
+    <div id="left-panel-resizer" class="panel-resizer panel-resizer-left" role="separator" tabindex="0"
+      aria-label="Resize course panel" aria-controls="course-rail" aria-orientation="vertical" title="Drag to resize the course panel"></div>
+
+    <main class="reader-panel">
+      <div class="reader-controls" aria-label="Reader controls">
+        <button id="toggle-left-panel" class="panel-toggle panel-toggle-left" type="button"
+          aria-controls="course-rail" aria-expanded="true" title="Hide course panel">
+          <span class="panel-toggle-arrow" aria-hidden="true">‹</span>
+          <span>Course</span>
+        </button>
+        <button id="toggle-right-panel" class="panel-toggle panel-toggle-right" type="button"
+          aria-controls="margin-panel" aria-expanded="true" title="Hide margin panel">
+          <span>Margin</span>
+          <span class="panel-toggle-arrow" aria-hidden="true">›</span>
+        </button>
+        <div class="font-size-control" role="group" aria-label="Reading workspace size">
+          <button id="decrease-font-size" type="button" aria-label="Decrease workspace size" title="Decrease workspace size">A−</button>
+          <button id="reset-font-size" class="font-size-value" type="button" aria-label="Reset workspace size" title="Reset workspace size">
+            <span id="font-size-value">100%</span>
+          </button>
+          <button id="increase-font-size" type="button" aria-label="Increase workspace size" title="Increase workspace size">A+</button>
+        </div>
+      </div>
+      <div class="frame-wrap">
+        <iframe id="lesson-frame" title="Lecture" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+        <div id="selection-popover" class="selection-popover" hidden>
+          <button type="button" id="leave-message-button">Add note</button>
+        </div>
+      </div>
+    </main>
+
+    <div id="right-panel-resizer" class="panel-resizer panel-resizer-right" role="separator" tabindex="0"
+      aria-label="Resize margin panel" aria-controls="margin-panel" aria-orientation="vertical" title="Drag to resize the margin panel"></div>
+
+    <aside class="margin-panel" id="margin-panel" aria-label="Margin messages">
+      <div class="panel-scale-content" id="margin-panel-content">
+        <header class="margin-header">
+          <h2>Margin</h2>
+          <div class="margin-header-meta">
+            <button id="lecture-history-button" class="lecture-history-button" type="button" disabled
+              aria-label="Open lecture history" title="Open lecture history">v—</button>
+            <span id="unused-count" class="unused-count">0 unused</span>
+          </div>
+        </header>
+
+        <section id="composer" class="composer" aria-labelledby="composer-title">
+        <div class="composer-topline">
+          <span id="composer-title">New note</span>
+          <button id="cancel-message" class="icon-button" type="button" aria-label="Clear note">×</button>
+        </div>
+        <div class="selected-context" id="selected-context" hidden>
+          <blockquote id="selected-quote"></blockquote>
+        </div>
+        <label class="visually-hidden" for="message-input">Note</label>
+        <textarea id="message-input" rows="3" placeholder="Write a note…"></textarea>
+        <div class="image-preview" id="image-preview" hidden>
+          <img id="image-preview-img" alt="Image attached to this note">
+          <div><span id="image-preview-name"></span><small id="image-preview-size"></small></div>
+          <button id="remove-image" class="icon-button" type="button" aria-label="Remove attached image">×</button>
+        </div>
+        <div class="composer-actions">
+          <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+          <button id="attach-image" class="secondary-button" type="button">+ Image</button>
+          <span class="paste-hint">Paste or drop</span>
+          <button id="save-message" class="primary-button" type="button">Save</button>
+        </div>
+        </section>
+
+        <section class="messages-section" aria-labelledby="messages-title">
+          <div class="margin-section-heading">
+            <h3 id="messages-title">Notes</h3>
+            <span id="message-count"></span>
+          </div>
+          <div id="message-list" class="message-list"></div>
+        </section>
+
+        <section id="teacher-run" class="teacher-run" data-state="running" hidden aria-live="polite" aria-atomic="false">
+          <div class="run-indicator" aria-hidden="true"><span></span></div>
+          <div class="run-content">
+            <div class="run-topline">
+              <strong id="run-title">Teacher is working</strong>
+              <button id="cancel-run" class="text-button" type="button">Cancel</button>
+            </div>
+            <p id="run-activity">Working in the background…</p>
+            <button id="open-run-details" class="run-details-link" type="button">Open activity →</button>
+          </div>
+        </section>
+
+        <section class="teacher-dock">
+        <div class="teacher-picker">
+          <button id="teacher-menu-button" class="teacher-menu-button" type="button" aria-haspopup="dialog" aria-expanded="false">
+            <span id="teacher-current-glyph" class="provider-glyph claude">A</span>
+            <span class="teacher-current-copy">
+              <small>Teacher</small>
+              <strong id="teacher-current-name">Claude Code</strong>
+              <span id="teacher-current-config" class="teacher-current-config">CLI defaults</span>
+            </span>
+            <span class="teacher-chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div id="provider-picker" class="provider-picker" role="dialog" aria-label="Teaching setup" hidden>
+            <div class="provider-row" data-provider-row="claude">
+              <button class="provider-option" type="button" data-provider="claude" aria-pressed="false">
+                <span class="provider-glyph claude">A</span>
+                <span><strong>Claude Code</strong><small data-provider-version="claude"></small></span>
+              </button>
+              <button class="provider-update" type="button" data-update-provider="claude"
+                aria-label="Check and update Claude Code" title="Check and update Claude Code">↻</button>
+            </div>
+            <div class="provider-row" data-provider-row="codex">
+              <button class="provider-option" type="button" data-provider="codex" aria-pressed="false">
+                <span class="provider-glyph codex">O</span>
+                <span><strong>Codex</strong><small data-provider-version="codex"></small></span>
+              </button>
+              <button class="provider-update" type="button" data-update-provider="codex"
+                aria-label="Check and update Codex" title="Check and update Codex">↻</button>
+            </div>
+            <div class="teacher-config-fields">
+              <label class="teacher-config-field" for="teacher-model-input">
+                <span>Model</span>
+                <select id="teacher-model-input" aria-describedby="teacher-config-hint">
+                  <option value="">CLI default</option>
+                </select>
+              </label>
+              <label class="teacher-config-field" for="teacher-effort-select">
+                <span>Thinking effort</span>
+                <select id="teacher-effort-select">
+                  <option value="">CLI default</option>
+                </select>
+              </label>
+            </div>
+            <p id="teacher-config-hint" class="teacher-config-hint">Blank values use the CLI defaults.</p>
+          </div>
+        </div>
+
+        <div class="teacher-actions">
+          <button id="revise-button" class="action-button revise" type="button">
+            <span>Revise this lecture</span>
+            <small id="revise-detail">Uses its unused messages</small>
+          </button>
+          <button id="next-button" class="action-button next" type="button">
+            <span>Write next lecture</span>
+            <small id="next-detail">Uses unused chapter messages</small>
+          </button>
+        </div>
+
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <section id="run-details-view" class="run-details-view" hidden aria-labelledby="run-detail-title">
+    <header class="run-details-header">
+      <button id="close-run-details" class="back-button" type="button">← Back</button>
+      <div>
+        <small>Teacher activity</small>
+        <h2 id="run-detail-title">Teacher is working</h2>
+      </div>
+    </header>
+    <main class="run-details-main">
+      <div class="run-detail-status">
+        <span class="run-detail-dot" aria-hidden="true"></span>
+        <span id="run-detail-activity">Working in the background…</span>
+      </div>
+      <div id="run-log" class="run-log" aria-label="Teacher activity log"></div>
+    </main>
+  </section>
+
+  <section id="history-view" class="history-view" hidden aria-labelledby="history-title">
+    <header class="history-header">
+      <button id="close-history" class="back-button" type="button">← Back</button>
+      <div>
+        <small>Lecture artifacts</small>
+        <h2 id="history-title">Lecture history</h2>
+        <p id="history-summary"></p>
+      </div>
+    </header>
+    <main class="history-main">
+      <ol id="history-list" class="history-list"></ol>
+      <section class="history-preview" aria-label="Version preview">
+        <div id="history-preview-empty">Choose a version to preview.</div>
+        <iframe id="history-preview-frame" title="Lecture version preview" sandbox="allow-scripts" referrerpolicy="no-referrer" hidden></iframe>
+      </section>
+    </main>
+  </section>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
