@@ -898,7 +898,14 @@ test("replaying a completed next-lecture operation does not launch a teacher or 
     annotationIds: [],
     operationId: "next-lecture-test-1",
   };
-  const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess: fake.spawnProcess });
+  let providerLookups = 0;
+  const server = createAppServer({
+    providerLookup: async () => {
+      providerLookups += 1;
+      return READY_CODEX;
+    },
+    spawnProcess: fake.spawnProcess,
+  });
   const [first, concurrentReplay] = await Promise.all([
     requestApp(server, { method: "POST", pathname: "/api/teacher", body: JSON.stringify(body) }),
     requestApp(server, { method: "POST", pathname: "/api/teacher", body: JSON.stringify(body) }),
@@ -919,6 +926,7 @@ test("replaying a completed next-lecture operation does not launch a teacher or 
   assert.equal(replayEvents[0].lesson, "lessons/0002-follow-up.html");
   const scopedStatus = await requestApp(replayServer, { pathname: "/api/operations/next-lecture-test-1?course=systems" });
   assert.equal(JSON.parse(scopedStatus.body.toString("utf8")).status, "complete");
+  assert.equal(providerLookups, 1);
   assert.equal(fake.calls.length, 1);
   assert.deepEqual((await readCourseStructure(course)).chapters[0].lectures.map((item) => item.path), [
     "lessons/0001-start.html",

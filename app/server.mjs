@@ -1217,7 +1217,10 @@ async function runCourseCreation(request, response, body, {
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
 
-async function runTeacher(request, response, body, { spawnProcess = spawn } = {}) {
+async function runTeacher(request, response, body, {
+  providerLookup = providerInfo,
+  spawnProcess = spawn,
+} = {}) {
   const courseId = assertCourseId(body.course);
   const action = body.action === "revise" || body.action === "next" ? body.action : "";
   if (!action) throw new Error("Unknown teacher action");
@@ -1283,7 +1286,7 @@ async function runTeacher(request, response, body, { spawnProcess = spawn } = {}
       streamOperationComplete(response, replay);
       return;
     }
-    const installed = await providerInfo(provider);
+    const installed = await providerLookup(provider);
     if (!installed.available) throw new Error(`${provider === "claude" ? "Claude Code" : "Codex"} is not available on PATH`);
     if (!installed.compatible || !installed.authenticated) throw new Error(installed.error || "The selected teacher is not ready");
     providerOptions = normalizeProviderOptions(provider, { model: body.model, effort: body.effort }, installed.models);
@@ -1645,7 +1648,7 @@ async function handleRequest(request, response, {
   }
 
   if (pathname === "/api/teacher" && request.method === "POST") {
-    await runTeacher(request, response, await readJson(request), { spawnProcess });
+    await runTeacher(request, response, await readJson(request), { providerLookup, spawnProcess });
     return;
   }
 
