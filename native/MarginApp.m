@@ -6,6 +6,7 @@
 static NSString *const MarginReadyPrefix = @"MARGIN_READY ";
 static NSString *const MarginLibraryDefaultsKey = @"MarginLibraryPath";
 static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
+static const int MarginLibraryBusyExitStatus = 75;
 
 @interface MarginAppDelegate : NSObject <NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate>
 
@@ -16,6 +17,7 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
 @property(nonatomic, strong) NSTextField *statusDetail;
 @property(nonatomic, strong) NSProgressIndicator *progressIndicator;
 @property(nonatomic, strong) NSButton *retryButton;
+@property(nonatomic, strong) NSButton *changeLibraryButton;
 @property(nonatomic, strong) NSButton *showLogButton;
 
 @property(nonatomic, strong) NSTask *serverTask;
@@ -38,6 +40,9 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
 @property(nonatomic) BOOL suppressTerminationError;
 @property(nonatomic) BOOL quitting;
 @property(nonatomic) BOOL terminationReplyPending;
+
+- (BOOL)hasActiveTeacherTask;
+- (BOOL)confirmStoppingActiveTeacherForAction:(NSString *)action;
 
 @end
 
@@ -98,6 +103,10 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
   (void)sender;
+  NSString *stopAndQuit = [NSString stringWithFormat:@"Stop Teacher and Quit %@", [self appDisplayName]];
+  if (!self.quitting && ![self confirmStoppingActiveTeacherForAction:stopAndQuit]) {
+    return NSTerminateCancel;
+  }
   self.quitting = YES;
 
   NSTask *task = self.serverTask;
@@ -254,11 +263,21 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
   self.retryButton.keyEquivalent = @"\r";
   self.retryButton.hidden = YES;
 
+  self.changeLibraryButton = [NSButton buttonWithTitle:@"Change Library…"
+                                                target:self
+                                                action:@selector(changeLibrary:)];
+  self.changeLibraryButton.bezelStyle = NSBezelStyleRounded;
+  self.changeLibraryButton.hidden = YES;
+
   self.showLogButton = [NSButton buttonWithTitle:@"Show server log" target:self action:@selector(showLog:)];
   self.showLogButton.bezelStyle = NSBezelStyleRounded;
   self.showLogButton.hidden = YES;
 
-  NSStackView *buttonRow = [NSStackView stackViewWithViews:@[self.retryButton, self.showLogButton]];
+  NSStackView *buttonRow = [NSStackView stackViewWithViews:@[
+    self.retryButton,
+    self.changeLibraryButton,
+    self.showLogButton,
+  ]];
   buttonRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
   buttonRow.alignment = NSLayoutAttributeCenterY;
   buttonRow.spacing = 8;
@@ -305,6 +324,14 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
                      detail:(NSString *)detail
                     loading:(BOOL)loading
                       retry:(BOOL)retry {
+  [self showStatusWithTitle:title detail:detail loading:loading retry:retry changeLibrary:NO];
+}
+
+- (void)showStatusWithTitle:(NSString *)title
+                     detail:(NSString *)detail
+                    loading:(BOOL)loading
+                      retry:(BOOL)retry
+              changeLibrary:(BOOL)changeLibrary {
   dispatch_async(dispatch_get_main_queue(), ^{
     self.statusTitle.stringValue = title;
     self.statusDetail.stringValue = detail;
@@ -312,6 +339,7 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
     self.webView.hidden = YES;
     self.progressIndicator.hidden = !loading;
     self.retryButton.hidden = !retry;
+    self.changeLibraryButton.hidden = !changeLibrary;
     self.showLogButton.hidden = !retry || !self.logURL;
     if (loading) {
       [self.progressIndicator startAnimation:nil];
@@ -383,7 +411,6 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
     case NSAlertSecondButtonReturn:
       return [self createLibrary];
     default:
-      self.quitting = YES;
       [NSApp terminate:nil];
       return nil;
   }
@@ -429,6 +456,27 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
   NSError *error = nil;
   if (![manager createDirectoryAtURL:state withIntermediateDirectories:YES attributes:nil error:&error]) return nil;
   return state;
+}
+
+- (BOOL)hasActiveTeacherTask {
+  if (!self.serverTask.running) return NO;
+  NSURL *stateRoot = [self stateRootURL];
+  if (!stateRoot) return NO;
+  NSURL *marker = [stateRoot URLByAppendingPathComponent:@".active-teacher-task.json" isDirectory:NO];
+  NSDictionary<NSFileAttributeKey, id> *attributes =
+      [NSFileManager.defaultManager attributesOfItemAtPath:marker.path error:nil];
+  return [attributes[NSFileType] isEqualToString:NSFileTypeRegular];
+}
+
+- (BOOL)confirmStoppingActiveTeacherForAction:(NSString *)action {
+  if (![self hasActiveTeacherTask]) return YES;
+  NSAlert *alert = [[NSAlert alloc] init];
+  alert.alertStyle = NSAlertStyleWarning;
+  alert.messageText = @"A teacher is still working";
+  alert.informativeText = @"Margin can stay open while the teacher works in the background. Stopping now cancels the teacher and rolls back any work that has not crossed its save boundary.";
+  [alert addButtonWithTitle:@"Keep Margin Open"];
+  [alert addButtonWithTitle:action];
+  return [alert runModal] == NSAlertSecondButtonReturn;
 }
 
 - (void)exportProviderIconWithBundleIdentifiers:(NSArray<NSString *> *)bundleIdentifiers
@@ -501,6 +549,13 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
   return token;
 }
 
+- (void)appendExistingDirectory:(NSString *)path to:(NSMutableOrderedSet<NSString *> *)paths {
+  BOOL isDirectory = NO;
+  if (path.length && [NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDirectory] && isDirectory) {
+    [paths addObject:path];
+  }
+}
+
 - (NSString *)safePathEnvironment {
   NSString *home = NSHomeDirectory();
   NSMutableOrderedSet<NSString *> *paths = [NSMutableOrderedSet orderedSetWithArray:@[
@@ -515,6 +570,23 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
     @"/usr/sbin",
     @"/sbin",
   ]];
+
+  // A Finder launch inherits launchd's minimal PATH, so provider CLIs installed
+  // through Node version managers are invisible without their directories.
+  [self appendExistingDirectory:[home stringByAppendingPathComponent:@".asdf/shims"] to:paths];
+  [self appendExistingDirectory:[home stringByAppendingPathComponent:@".local/share/mise/shims"] to:paths];
+  [self appendExistingDirectory:[home stringByAppendingPathComponent:@"Library/Application Support/fnm/aliases/default/bin"]
+                             to:paths];
+  [self appendExistingDirectory:[home stringByAppendingPathComponent:@".fnm/aliases/default/bin"] to:paths];
+  NSString *nvmVersions = [home stringByAppendingPathComponent:@".nvm/versions/node"];
+  NSArray<NSString *> *nvmEntries = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:nvmVersions error:nil]
+      sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+  for (NSString *entry in nvmEntries.reverseObjectEnumerator) {
+    [self appendExistingDirectory:[[nvmVersions stringByAppendingPathComponent:entry]
+                                      stringByAppendingPathComponent:@"bin"]
+                               to:paths];
+  }
+
   NSString *inherited = NSProcessInfo.processInfo.environment[@"PATH"];
   for (NSString *component in [inherited componentsSeparatedByString:@":"]) {
     if (component.length) [paths addObject:component];
@@ -906,6 +978,15 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
     return;
   }
 
+  if (task.terminationStatus == MarginLibraryBusyExitStatus) {
+    [self showStatusWithTitle:@"This library is already open"
+                       detail:@"Another Margin app is using this learning library. Quit the other app and restart, or choose a different library."
+                      loading:NO
+                        retry:YES
+                changeLibrary:YES];
+    return;
+  }
+
   NSString *detail = [NSString stringWithFormat:@"The local teaching service stopped (status %d). Open the log for details.",
                                                 task.terminationStatus];
   [self showStatusWithTitle:@"Margin stopped" detail:detail loading:NO retry:YES];
@@ -914,6 +995,7 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
 - (IBAction)retryBackend:(id)sender {
   (void)sender;
   if (self.serverTask.running) {
+    if (![self confirmStoppingActiveTeacherForAction:@"Stop Teacher and Restart Margin"]) return;
     self.restartAfterStop = YES;
     self.suppressTerminationError = YES;
     [self.serverTask terminate];
@@ -924,6 +1006,7 @@ static const unsigned long long MarginLogLimit = 2 * 1024 * 1024;
 
 - (IBAction)changeLibrary:(id)sender {
   (void)sender;
+  if (![self confirmStoppingActiveTeacherForAction:@"Stop Teacher and Change Library"]) return;
   NSURL *libraryURL = [self promptForLibrary];
   if (!libraryURL) return;
   [self saveLibraryURL:libraryURL];

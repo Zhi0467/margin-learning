@@ -1,5 +1,6 @@
 .DS_Store
 .margin-library.lock
+.margin-trash/
 .margin-course-transactions/
 .build/
 .cache/

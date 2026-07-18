@@ -14,6 +14,7 @@ import {
   deleteAnnotation,
   discoverCourses,
   discoverCoursesDetailed,
+  htmlText,
   lectureHistoryStoreMatches,
   markAnnotationsUsed,
   normalizeProviderOptions,
@@ -29,6 +30,7 @@ import {
   readLectureHistory,
   readLectureVersionContent,
   recordLectureVersion,
+  recoverCourseCreationArtifacts,
   restoreLectureVersion,
   restoreLectureHistoryStore,
   safeCoursePath,
@@ -49,6 +51,7 @@ import {
   restoreAppOwnedLearnerState,
   restoreCourseManifestSnapshot,
   snapshotAppOwnedLearnerState,
+  startupExitStatus,
   teacherRequestEndedEarly,
   validateFirstLectureDraft,
   validateLectureArtifact,
@@ -212,6 +215,11 @@ const READY_CODEX = {
   models: [{ id: "gpt-test", label: "GPT Test", default: true, supportedEfforts: ["high"] }],
 };
 
+test("decodes nested HTML entities without turning encoded markup into tags", () => {
+  assert.equal(htmlText("Fish &amp; Chips &lt; Basics"), "Fish & Chips < Basics");
+  assert.equal(htmlText("Show &amp;lt;code&amp;gt; literally"), "Show &lt;code&gt; literally");
+});
+
 test("discovers teaching workspaces and lecture metadata", async (t) => {
   const { root } = await fixture();
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -223,6 +231,20 @@ test("discovers teaching workspaces and lecture metadata", async (t) => {
   assert.deepEqual(courses[0].chapters.map((item) => item.title), ["Foundations"]);
   assert.deepEqual(courses[0].chapters[0].lectures.map((item) => item.title), ["The first lecture"]);
   assert.equal(courses[0].chapters[0].lectures[0].chapterId, "foundations");
+});
+
+test("does not hide a library course whose id is app", async (t) => {
+  const { root } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const appCourse = path.join(root, "app");
+  await mkdir(path.join(appCourse, "lessons"), { recursive: true });
+  await writeFile(path.join(appCourse, "MISSION.md"), "# Mission: App\n\n## Why\nShip a real app.\n", "utf8");
+  await writeFile(path.join(appCourse, "lessons", "0001-shipping.html"), "<title>Shipping</title><h1>Shipping</h1>", "utf8");
+  await writeFile(path.join(appCourse, "COURSE.json"), `${JSON.stringify({
+    version: 1,
+    chapters: [{ id: "foundations", title: "Foundations", description: "", lectures: ["lessons/0001-shipping.html"] }],
+  }, null, 2)}\n`, "utf8");
+  assert.deepEqual((await discoverCourses(root)).map((course) => course.id).sort(), ["app", "systems"]);
 });
 
 test("discovers valid courses while reporting malformed course diagnostics through the API", async (t) => {
@@ -248,6 +270,20 @@ test("discovers valid courses while reporting malformed course diagnostics throu
   const body = JSON.parse(response.body.toString("utf8"));
   assert.deepEqual(body.courses.map((course) => course.id), ["systems"]);
   assert.deepEqual(body.diagnostics.map((diagnostic) => diagnostic.id), ["broken-course"]);
+
+  const plain = path.join(root, "plain-directory");
+  await mkdir(plain);
+  const rejectedDelete = await requestApp(createAppServer(), { method: "DELETE", pathname: "/api/courses/plain-directory" });
+  assert.equal(rejectedDelete.status, 400);
+  assert.equal((await lstat(plain)).isDirectory(), true);
+
+  const brokenDelete = await requestApp(createAppServer(), { method: "DELETE", pathname: "/api/courses/broken-course" });
+  assert.equal(brokenDelete.status, 200);
+  await assert.rejects(lstat(broken), { code: "ENOENT" });
+  const trashed = await readdir(path.join(root, ".margin-trash"));
+  assert.equal(trashed.filter((entry) => entry.startsWith("broken-course--")).length, 1);
+  const refreshed = JSON.parse((await requestApp(createAppServer(), { pathname: "/api/courses" })).body.toString("utf8"));
+  assert.deepEqual(refreshed.diagnostics, []);
 });
 
 test("creates hidden empty course drafts without a placeholder lecture", async (t) => {
@@ -269,6 +305,41 @@ test("creates hidden empty course drafts without a placeholder lecture", async (
   assert.match(await readFile(path.join(first.root, "MISSION.md"), "utf8"), /Understand the machinery/);
   assert.match(await readFile(path.join(first.root, "assets", "styles.css"), "utf8"), /--accent/);
   await assert.rejects(() => createCourseWorkspace(root, { title: "" }), /Course title is required/);
+});
+
+test("startup recovery removes stale id locks, promotes completed drafts, and archives incomplete drafts", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "margin-create-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const completed = await createCourseWorkspace(root, {
+    title: "Recovered course",
+    initialRequest: "Teach recovery behavior.",
+  });
+  const manifestSnapshot = (await readCourseStructure(completed.root, { allowEmptyChapters: true })).manifestText;
+  const lesson = "lessons/0001-recovered.html";
+  await writeFile(
+    path.join(completed.root, lesson),
+    "<!doctype html><html><head><title>Recovered</title></head><body><h1 data-learn-block=\"recovered\">Recovered</h1><p>This complete recovered lecture explains why durable creation receipts preserve finished work.</p></body></html>",
+    "utf8",
+  );
+  await appendLectureToChapter(completed.root, "foundations", lesson, manifestSnapshot);
+  await recordLectureVersion(completed.root, lesson, {
+    action: "create",
+    provider: "codex",
+    operationId: "recovered-course-test-1",
+    operationAction: "course-create",
+    requestHash: "a".repeat(64),
+  });
+  await createCourseWorkspace(root, { title: "Incomplete course", initialRequest: "This draft never finished." });
+  await writeFile(path.join(root, ".margin-course-id-stale.lock"), "stale\n", "utf8");
+
+  const recovery = await recoverCourseCreationArtifacts(root);
+  assert.deepEqual(recovery.removedLocks, [".margin-course-id-stale.lock"]);
+  assert.equal(recovery.recoveredCourses.length, 1);
+  assert.equal(recovery.recoveredCourses[0].id, "recovered-course");
+  assert.equal(recovery.recoveredCourses[0].operationId, "recovered-course-test-1");
+  assert.equal(recovery.archivedDrafts.length, 1);
+  assert.match(recovery.archivedDrafts[0], /^\.margin-trash\/recovered-drafts\//);
+  assert.deepEqual((await discoverCourses(root)).map((course) => course.id), ["recovered-course"]);
 });
 
 test("course creation API streams, versions, and atomically reveals the first real lecture", async (t) => {
@@ -399,10 +470,52 @@ test("failed first-lecture generation never reveals a course", async (t) => {
   assert.match(events.at(-1).text, /exited with code 1/);
   assert.match(fake.calls[0].prompt, /Legacy goal alias/);
   assert.deepEqual(await discoverCourses(root), []);
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual((await readdir(root)).filter((name) => name !== ".margin-state"), []);
 });
 
-test("cancels a hung teacher with TERM then KILL and waits for it to close before releasing the task slot", async (t) => {
+test("a spawn failure is reported even when the teacher stdin also closes early", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "margin-course-spawn-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?course-spawn-failure=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const spawnProcess = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.kill = () => {
+      if (child.exitCode == null) {
+        child.exitCode = 1;
+        queueMicrotask(() => child.emit("close", 1, null));
+      }
+      return true;
+    };
+    child.stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        const inputError = Object.assign(new Error("broken pipe"), { code: "EPIPE" });
+        queueMicrotask(() => child.emit("error", Object.assign(new Error("teacher executable missing"), { code: "ENOENT" })));
+        callback(inputError);
+      },
+    });
+    return child;
+  };
+  const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess });
+  const response = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/courses/create",
+    body: JSON.stringify({ title: "Spawn failure", initialRequest: "Teach error reporting.", provider: "codex" }),
+  });
+  const events = response.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "error");
+  assert.match(events.at(-1).text, /Could not start the teacher: teacher executable missing/);
+  assert.doesNotMatch(events.at(-1).text, /did not accept its input/);
+});
+
+test("an explicit cancel stops a hung teacher with TERM then KILL before releasing the task slot", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "margin-course-cancel-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
@@ -439,8 +552,29 @@ test("cancels a hung teacher with TERM then KILL and waits for it to close befor
   const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess });
   await disconnectStreamingRequest(server, {
     pathname: "/api/courses/create",
-    body: JSON.stringify({ title: "Cancelled course", initialRequest: "Teach cancellation.", provider: "codex" }),
+    body: JSON.stringify({
+      title: "Cancelled course",
+      initialRequest: "Teach cancellation.",
+      provider: "codex",
+      operationId: "explicit-cancel-test-1",
+    }),
   });
+  assert.deepEqual(signals, []);
+  assert.equal((await lstat(path.join(root, ".margin-state", ".active-teacher-task.json"))).isFile(), true);
+  const unrelatedPromotionLock = path.join(root, ".margin-course-id-keep.lock");
+  await writeFile(unrelatedPromotionLock, "do not recover while another task is active\n", "utf8");
+  const deferred = await requestApp(server, { pathname: "/api/operations/stale-operation-test-1" });
+  assert.equal(JSON.parse(deferred.body.toString("utf8")).status, "deferred");
+  assert.equal((await lstat(unrelatedPromotionLock)).isFile(), true);
+  const running = await requestApp(server, { pathname: "/api/operations/explicit-cancel-test-1" });
+  assert.equal(JSON.parse(running.body.toString("utf8")).status, "running");
+  const cancel = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/operations/explicit-cancel-test-1/cancel",
+    body: "{}",
+  });
+  assert.equal(cancel.status, 202);
+  assert.equal(JSON.parse(cancel.body.toString("utf8")).status, "cancelling");
   await new Promise((resolve) => setTimeout(resolve, 130));
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
   assert.equal(firstTeacherClosed, false);
@@ -454,6 +588,7 @@ test("cancels a hung teacher with TERM then KILL and waits for it to close befor
   await new Promise((resolve) => setTimeout(resolve, 180));
   assert.equal(firstTeacherClosed, true);
   assert.deepEqual(await discoverCourses(root), []);
+  await assert.rejects(lstat(path.join(root, ".margin-state", ".active-teacher-task.json")), { code: "ENOENT" });
 
   const retry = await requestApp(server, {
     method: "POST",
@@ -464,7 +599,7 @@ test("cancels a hung teacher with TERM then KILL and waits for it to close befor
   assert.equal(retryEvents.at(-1).type, "complete");
 });
 
-test("a response close latched during provider finalization prevents course promotion", async (t) => {
+test("a response close during provider finalization does not discard a completed course", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "margin-course-finalize-cancel-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
@@ -477,11 +612,18 @@ test("a response close latched during provider finalization prevents course prom
   const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess: fake.spawnProcess });
   await disconnectStreamingRequest(server, {
     pathname: "/api/courses/create",
-    body: JSON.stringify({ title: "Finalization race", initialRequest: "Teach commit boundaries.", provider: "codex" }),
+    body: JSON.stringify({
+      title: "Finalization race",
+      initialRequest: "Teach commit boundaries.",
+      provider: "codex",
+      operationId: "durable-finalization-test-1",
+    }),
     disconnectOn: "summary",
   });
   await new Promise((resolve) => setTimeout(resolve, 180));
-  assert.deepEqual(await discoverCourses(root), []);
+  assert.deepEqual((await discoverCourses(root)).map((course) => course.id), ["finalization-race"]);
+  const status = await requestApp(server, { pathname: "/api/operations/durable-finalization-test-1" });
+  assert.equal(JSON.parse(status.body.toString("utf8")).status, "complete");
 });
 
 test("course promotion preserves an existing destination and chooses a collision suffix", async (t) => {
@@ -574,10 +716,74 @@ test("requires the per-launch session for every API request and persists prefere
     method: "PATCH", pathname: "/api/settings", body: JSON.stringify({ key: "margin:workspace-scale", value: "1.2" }),
   });
   assert.equal(saved.status, 200);
+  const savedDocument = await requestApp(server, {
+    method: "PATCH", pathname: "/api/settings", body: JSON.stringify({ key: "margin:document:systems", value: "lessons/0001-start.html" }),
+  });
+  assert.equal(savedDocument.status, 200);
   const settingsFile = path.join(stateRoot, "settings.json");
   assert.deepEqual(JSON.parse(await readFile(settingsFile, "utf8")), { "margin:workspace-scale": "1.2" });
   assert.equal((await lstat(settingsFile)).mode & 0o777, 0o600);
+  const libraryIds = await readdir(path.join(stateRoot, "libraries"));
+  assert.equal(libraryIds.length, 1);
+  const librarySettingsFile = path.join(stateRoot, "libraries", libraryIds[0], "settings.json");
+  assert.deepEqual(JSON.parse(await readFile(librarySettingsFile, "utf8")), {
+    "margin:document:systems": "lessons/0001-start.html",
+  });
+  assert.equal((await lstat(librarySettingsFile)).mode & 0o777, 0o600);
   assert.deepEqual((await readdir(stateRoot)).filter((name) => name.startsWith(".settings-")), []);
+});
+
+test("document and pending-operation settings stay scoped to their learning library", async (t) => {
+  const firstRoot = await mkdtemp(path.join(tmpdir(), "margin-library-a-"));
+  const secondRoot = await mkdtemp(path.join(tmpdir(), "margin-library-b-"));
+  const stateRoot = await mkdtemp(path.join(tmpdir(), "margin-shared-state-"));
+  t.after(() => Promise.all([
+    rm(firstRoot, { recursive: true, force: true }),
+    rm(secondRoot, { recursive: true, force: true }),
+    rm(stateRoot, { recursive: true, force: true }),
+  ]));
+
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  const previousStateRoot = process.env.MARGIN_STATE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = firstRoot;
+  process.env.MARGIN_STATE_ROOT = stateRoot;
+  const { createAppServer: createFirstServer } = await import(`../server.mjs?library-a=${Date.now()}`);
+  process.env.MARGIN_WORKSPACE_ROOT = secondRoot;
+  const { createAppServer: createSecondServer } = await import(`../server.mjs?library-b=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT; else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+  if (previousStateRoot === undefined) delete process.env.MARGIN_STATE_ROOT; else process.env.MARGIN_STATE_ROOT = previousStateRoot;
+
+  const first = createFirstServer();
+  const second = createSecondServer();
+  await requestApp(first, {
+    method: "PATCH",
+    pathname: "/api/settings",
+    body: JSON.stringify({ key: "margin:workspace-scale", value: "1.25" }),
+  });
+  await requestApp(first, {
+    method: "PATCH",
+    pathname: "/api/settings",
+    body: JSON.stringify({ key: "margin:document:systems", value: "lessons/0001-a.html" }),
+  });
+  await requestApp(first, {
+    method: "PATCH",
+    pathname: "/api/settings",
+    body: JSON.stringify({ key: "margin:pending-operations", value: "first-library-receipt" }),
+  });
+
+  const secondBootstrap = JSON.parse((await requestApp(second, { pathname: "/api/bootstrap" })).body.toString("utf8"));
+  assert.equal(secondBootstrap.settings["margin:workspace-scale"], "1.25");
+  assert.equal(secondBootstrap.settings["margin:document:systems"], undefined);
+  assert.equal(secondBootstrap.settings["margin:pending-operations"], undefined);
+  await requestApp(second, {
+    method: "PATCH",
+    pathname: "/api/settings",
+    body: JSON.stringify({ key: "margin:document:systems", value: "lessons/0001-b.html" }),
+  });
+  const firstBootstrap = JSON.parse((await requestApp(first, { pathname: "/api/bootstrap" })).body.toString("utf8"));
+  assert.equal(firstBootstrap.settings["margin:document:systems"], "lessons/0001-a.html");
+  assert.equal(firstBootstrap.settings["margin:pending-operations"], "first-library-receipt");
+  assert.equal((await readdir(path.join(stateRoot, "libraries"))).length, 2);
 });
 
 test("uses the native launch token exactly and removes secret or state environment from providers", () => {
@@ -590,8 +796,19 @@ test("uses the native launch token exactly and removes secret or state environme
   assert.doesNotMatch(launchReadyLine("127.0.0.1", 4177, "http://127.0.0.1:4999"), /session=/);
   const environment = providerEnvironment({
     PATH: "/bin", HOME: "/tmp/home", LANG: "en_US.UTF-8", API_TOKEN: "secret", MARGIN_STATE_ROOT: "/private", AWS_SECRET_ACCESS_KEY: "secret",
+    HTTPS_PROXY: "http://proxy.internal:3128", no_proxy: "localhost", ANTHROPIC_API_KEY: "sk-provider-owned",
   });
-  assert.deepEqual(environment, { PATH: "/bin", HOME: "/tmp/home", LANG: "en_US.UTF-8", NO_COLOR: "1", FORCE_COLOR: "0" });
+  assert.deepEqual(environment, {
+    PATH: "/bin", HOME: "/tmp/home", LANG: "en_US.UTF-8",
+    HTTPS_PROXY: "http://proxy.internal:3128", no_proxy: "localhost", ANTHROPIC_API_KEY: "sk-provider-owned",
+    NO_COLOR: "1", FORCE_COLOR: "0",
+  });
+});
+
+test("maps an occupied library to the native actionable startup status", () => {
+  assert.equal(startupExitStatus({ code: "MARGIN_LIBRARY_LOCKED" }), 75);
+  assert.equal(startupExitStatus({ code: "MARGIN_LIBRARY_LOCK_UNSAFE" }), 1);
+  assert.equal(startupExitStatus(new Error("startup failed")), 1);
 });
 
 test("rejects a replaced course root before app-owned rollback can follow it", async (t) => {
@@ -772,10 +989,10 @@ test("persists image-only annotations as metadata and removes their files", asyn
     quote: "",
     message: "",
     anchor: null,
-    image: { dataUrl: imageDataUrl("image/png", ONE_PIXEL_PNG) },
+    image: { dataUrl: imageDataUrl("image/png", ONE_PIXEL_PNG), name: "pronunciation chart.png" },
   });
 
-  assert.deepEqual(annotation.image, { type: "image/png", bytes: ONE_PIXEL_PNG.length });
+  assert.deepEqual(annotation.image, { type: "image/png", bytes: ONE_PIXEL_PNG.length, name: "pronunciation chart.png" });
   assert.equal(annotation.anchor, null);
   assert.ok(!Object.hasOwn(annotation.image, "dataUrl"));
   const storedText = await readFile(path.join(root, "systems", ".learn", "annotations.json"), "utf8");
@@ -865,6 +1082,219 @@ test("teacher rollback restores the complete course after malformed lesson and s
   assert.deepEqual((await readAnnotationStore(root, "systems")).annotations.map((item) => item.id), [annotation.id]);
   const restoredHistory = JSON.parse(await readFile(path.join(course, ".learn", "lecture-history.json"), "utf8"));
   assert.ok(restoredHistory.lectures["lessons/0001-start.html"]);
+});
+
+test("a teacher may build utilities in the selected course but cannot leave changes in another course", async (t) => {
+  const { root, course } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const other = path.join(root, "spanish");
+  await mkdir(path.join(other, "lessons"), { recursive: true });
+  await mkdir(path.join(other, "reference"));
+  await writeFile(path.join(other, "MISSION.md"), "# Mission: Spanish\n\nLearn Spanish.\n", "utf8");
+  await writeFile(
+    path.join(other, "lessons", "0001-hola.html"),
+    "<!doctype html><html><head><title>Hola</title></head><body><h1 data-learn-block=\"hola\">Hola</h1><p>A complete introductory Spanish lesson.</p></body></html>",
+    "utf8",
+  );
+  await writeFile(path.join(other, "COURSE.json"), `${JSON.stringify({
+    version: 1,
+    chapters: [{ id: "foundations", title: "Foundations", lectures: ["lessons/0001-hola.html"] }],
+  }, null, 2)}\n`, "utf8");
+  await writeFile(path.join(other, "vocabulary.json"), "{\"known\":[\"hola\"]}\n", "utf8");
+
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?other-course-guard=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const fake = fakeProviderSpawner({
+    writeLesson: false,
+    mutate: async ({ courseRoot }) => {
+      await writeFile(
+        path.join(courseRoot, "lessons", "0002-utility.html"),
+        "<!doctype html><html><head><title>Utility</title></head><body><h1 data-learn-block=\"utility\">Utility</h1><p>This substantive follow-up also creates a course-local learner utility.</p></body></html>",
+        "utf8",
+      );
+      await writeFile(path.join(courseRoot, "concept-database.json"), "{\"known\":[\"first principle\"]}\n", "utf8");
+      await writeFile(path.join(other, "vocabulary.json"), "{\"known\":[\"tampered\"]}\n", "utf8");
+    },
+  });
+  const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess: fake.spawnProcess });
+  const response = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/teacher",
+    body: JSON.stringify({
+      action: "next",
+      course: "systems",
+      chapter: "foundations",
+      lesson: "lessons/0001-start.html",
+      provider: "codex",
+      operationId: "other-course-guard-test-1",
+    }),
+  });
+  const events = response.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const completed = events.at(-1);
+  assert.equal(completed.type, "complete");
+  assert.match(completed.text, /Another recognized course changed while teaching was running \(spanish\)/);
+  assert.ok(events.some((event) => event.type === "status"
+    && /Another recognized course changed while teaching was running \(spanish\)/.test(event.text)
+    && /\.margin-trash\/guard-conflicts\/spanish--/.test(event.text)));
+  assert.equal(await readFile(path.join(other, "vocabulary.json"), "utf8"), "{\"known\":[\"hola\"]}\n");
+  const conflicts = await readdir(path.join(root, ".margin-trash", "guard-conflicts"));
+  assert.equal(conflicts.length, 1);
+  assert.equal(
+    await readFile(path.join(root, ".margin-trash", "guard-conflicts", conflicts[0], "vocabulary.json"), "utf8"),
+    "{\"known\":[\"tampered\"]}\n",
+  );
+  // The successful work in the selected course survives the other-course restore.
+  assert.equal(
+    await readFile(path.join(course, "concept-database.json"), "utf8"),
+    "{\"known\":[\"first principle\"]}\n",
+  );
+  assert.equal((await readCourseStructure(course)).lectures.at(-1).path, "lessons/0002-utility.html");
+});
+
+test("margin notes stay writable on other courses while a teacher works", async (t) => {
+  const { root } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const other = path.join(root, "spanish");
+  await mkdir(path.join(other, "lessons"), { recursive: true });
+  await writeFile(path.join(other, "MISSION.md"), "# Mission: Spanish\n\nLearn Spanish.\n", "utf8");
+  await writeFile(
+    path.join(other, "lessons", "0001-hola.html"),
+    "<!doctype html><html><head><title>Hola</title></head><body><h1 data-learn-block=\"hola\">Hola</h1><p>A complete introductory Spanish lesson.</p></body></html>",
+    "utf8",
+  );
+  await writeFile(path.join(other, "COURSE.json"), `${JSON.stringify({
+    version: 1,
+    chapters: [{ id: "foundations", title: "Foundations", lectures: ["lessons/0001-hola.html"] }],
+  }, null, 2)}\n`, "utf8");
+
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?notes-during-run=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  let server;
+  let otherCourseNote = null;
+  let taughtCourseNote = null;
+  const fake = fakeProviderSpawner({
+    writeLesson: false,
+    mutate: async ({ courseRoot }) => {
+      await writeFile(
+        path.join(courseRoot, "lessons", "0002-followup.html"),
+        "<!doctype html><html><head><title>Follow up</title></head><body><h1 data-learn-block=\"follow-up\">Follow up</h1><p>This substantive second lecture proves notes stay writable during teaching.</p></body></html>",
+        "utf8",
+      );
+      otherCourseNote = await requestApp(server, {
+        method: "POST",
+        pathname: "/api/courses/spanish/annotations",
+        body: JSON.stringify({ lesson: "lessons/0001-hola.html", quote: "", message: "Reminder while the teacher works.", anchor: null }),
+      });
+      taughtCourseNote = await requestApp(server, {
+        method: "POST",
+        pathname: "/api/courses/systems/annotations",
+        body: JSON.stringify({ lesson: "lessons/0001-start.html", quote: "", message: "Blocked on the taught course.", anchor: null }),
+      });
+    },
+  });
+  server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess: fake.spawnProcess });
+  const response = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/teacher",
+    body: JSON.stringify({
+      action: "next",
+      course: "systems",
+      chapter: "foundations",
+      lesson: "lessons/0001-start.html",
+      provider: "codex",
+    }),
+  });
+  const events = response.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "complete");
+  assert.equal(otherCourseNote.status, 201);
+  assert.equal(taughtCourseNote.status, 409);
+  assert.ok(!events.some((event) => event.type === "status" && /Another recognized course changed/.test(event.text)));
+  assert.deepEqual(
+    (await readAnnotationStore(root, "spanish")).annotations.map((item) => item.message),
+    ["Reminder while the teacher works."],
+  );
+  assert.deepEqual((await readAnnotationStore(root, "systems")).annotations, []);
+  await assert.rejects(lstat(path.join(root, ".margin-trash")), { code: "ENOENT" });
+});
+
+test("an operation receipt whose course disappeared resolves to unknown instead of failing forever", async (t) => {
+  const { root } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?missing-course-status=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const response = await requestApp(createAppServer(), {
+    pathname: "/api/operations/orphan-operation-1?course=deleted-course",
+  });
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse(response.body.toString("utf8")).status, "unknown");
+});
+
+test("an unrelated unguardable course is reported without blocking teaching", async (t) => {
+  const { root, course } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const other = path.join(root, "linked-course");
+  await mkdir(path.join(other, "lessons"), { recursive: true });
+  await mkdir(path.join(other, "reference"));
+  await writeFile(path.join(other, "MISSION.md"), "# Mission: Linked course\n\nUse shared assets.\n", "utf8");
+  await writeFile(
+    path.join(other, "lessons", "0001-linked.html"),
+    "<!doctype html><html><head><title>Linked</title></head><body><h1 data-learn-block=\"linked\">Linked</h1><p>A complete course with a user-managed shared link.</p></body></html>",
+    "utf8",
+  );
+  await writeFile(path.join(other, "COURSE.json"), `${JSON.stringify({
+    version: 1,
+    chapters: [{ id: "foundations", title: "Foundations", lectures: ["lessons/0001-linked.html"] }],
+  }, null, 2)}\n`, "utf8");
+  const shared = path.join(root, "shared-assets");
+  await mkdir(shared);
+  await symlink(shared, path.join(other, "shared-assets"));
+
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?unguardable-course=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const fake = fakeProviderSpawner({
+    writeLesson: false,
+    mutate: async ({ courseRoot }) => {
+      await writeFile(
+        path.join(courseRoot, "lessons", "0002-continues.html"),
+        "<!doctype html><html><head><title>Continues</title></head><body><h1 data-learn-block=\"continues\">Continues</h1><p>This substantive follow-up proves an unrelated linked course does not block teaching.</p></body></html>",
+        "utf8",
+      );
+    },
+  });
+  const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess: fake.spawnProcess });
+  const response = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/teacher",
+    body: JSON.stringify({
+      action: "next",
+      course: "systems",
+      chapter: "foundations",
+      lesson: "lessons/0001-start.html",
+      provider: "codex",
+      operationId: "unguardable-course-test-1",
+    }),
+  });
+  const events = response.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "complete");
+  assert.ok(events.some((event) => event.type === "status" && /could not transactionally protect linked-course/.test(event.text)));
+  assert.equal((await readCourseStructure(course)).lectures.at(-1).path, "lessons/0002-continues.html");
+  assert.equal((await lstat(path.join(other, "shared-assets"))).isSymbolicLink(), true);
 });
 
 test("replaying a completed next-lecture operation does not launch a teacher or add another lecture", async (t) => {
@@ -1222,7 +1652,7 @@ test("lecture history API serves snapshots and restores as a new version", async
 
   const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
   process.env.MARGIN_WORKSPACE_ROOT = root;
-  const { createAppServer } = await import(`../server.mjs?history=${Date.now()}`);
+  const { createAppServer, createContentServer } = await import(`../server.mjs?history=${Date.now()}`);
   if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
   else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
   const server = createAppServer();
@@ -1235,13 +1665,15 @@ test("lecture history API serves snapshots and restores as a new version", async
   assert.deepEqual(history.commits.map((commit) => commit.version), [2, 1]);
   const baseline = history.commits.at(-1);
 
-  const content = await requestApp(server, {
-    pathname: `/api/courses/systems/history/content?lesson=lessons%2F0001-start.html&commit=${baseline.id}`,
+  const contentServer = createContentServer({ appOrigin: "http://127.0.0.1:4177" });
+  const content = await requestApp(contentServer, {
+    pathname: `/history/systems?lesson=lessons%2F0001-start.html&commit=${baseline.id}&bridge=history-test`,
   });
   assert.equal(content.status, 200);
   assert.equal(content.headers["Content-Type"], "text/html; charset=utf-8");
   assert.match(content.headers["Content-Security-Policy"], /^sandbox/);
-  assert.deepEqual(content.body, original);
+  assert.match(content.body.toString("utf8"), /The first lecture/);
+  assert.match(content.body.toString("utf8"), /history-test/);
 
   const restore = await requestApp(server, {
     method: "POST",

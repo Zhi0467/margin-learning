@@ -1,5 +1,7 @@
 const sessionUrl = new URL(window.location.href);
-const sessionToken = sessionUrl.searchParams.get("session") || "";
+const incomingSessionToken = sessionUrl.searchParams.get("session") || "";
+if (incomingSessionToken) sessionStorage.setItem("margin:session", incomingSessionToken);
+const sessionToken = incomingSessionToken || sessionStorage.getItem("margin:session") || "";
 sessionUrl.searchParams.delete("session");
 sessionUrl.searchParams.delete("contentOrigin");
 window.history.replaceState({}, "", `${sessionUrl.pathname}${sessionUrl.search}${sessionUrl.hash}`);
@@ -26,6 +28,7 @@ function persistPreference(key, value) {
 
 const state = {
   courses: [],
+  diagnostics: [],
   providers: [],
   course: null,
   documentPath: null,
@@ -48,6 +51,7 @@ const state = {
     },
   },
   newCourseRun: null,
+  pendingDeletion: null,
   leftPanelCollapsed: preference("margin:panel:left") === "true",
   rightPanelCollapsed: preference("margin:panel:right") === "true",
   coursePanelWidth: Number(preference("margin:panel:course-width")) || null,
@@ -59,7 +63,6 @@ const state = {
   historyRequestKey: "",
   historyPreviewCommit: "",
   activeRun: null,
-  providerCheck: false,
   navigationGeneration: 0,
   courseDiagnosticsSignature: "",
   staleLectures: new Set(),
@@ -74,6 +77,8 @@ const elements = Object.fromEntries([
   "new-course-request", "new-course-teacher-slip", "new-course-teacher-select", "new-course-model-select",
   "new-course-effort-select", "new-course-teacher-status", "new-course-config-hint", "new-course-progress",
   "new-course-progress-title", "new-course-progress-activity", "cancel-new-course", "create-new-course",
+  "delete-dialog", "delete-form", "delete-title", "delete-detail", "delete-recovery", "delete-error",
+  "cancel-delete", "confirm-delete",
   "back-to-library", "current-course-title", "chapter-list",
   "reference-list", "course-panel-content", "margin-panel-content", "left-panel-resizer", "right-panel-resizer",
   "toggle-left-panel", "toggle-right-panel", "decrease-font-size", "reset-font-size",
@@ -116,6 +121,8 @@ function freshOperationId() {
 
 const PENDING_OPERATIONS_KEY = "margin:pending-operations";
 const MAX_PENDING_OPERATIONS = 8;
+const OPERATION_RECONNECT_LIMIT_MS = 60 * 1000;
+let pendingReconciliationTimer = 0;
 
 function pendingOperations() {
   try {
@@ -182,12 +189,69 @@ async function reconcileOperation(operationId, { courseId = "", timeoutMilliseco
         return { status: "complete", event: result.event };
       }
       if (result.status === "unknown") return { status: "unknown" };
-      if (result.status !== "running" || Date.now() >= deadline) return { status: "unconfirmed" };
+      if (result.status === "deferred") return { status: "deferred", task: result.task };
+      if (result.status !== "running") return { status: "unconfirmed" };
+      if (Date.now() >= deadline) return { status: "running", task: result.task };
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
   } catch (error) {
     return { status: "unconfirmed", error };
   }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForOperationTerminal(operationId, { courseId = "", onRunning = () => {} } = {}) {
+  let connectionFailures = 0;
+  let disconnectedAt = 0;
+  while (true) {
+    const result = await reconcileOperation(operationId, { courseId, timeoutMilliseconds: 0 });
+    if (result.status === "running") {
+      connectionFailures = 0;
+      disconnectedAt = 0;
+      onRunning(result.task, null);
+      await delay(750);
+      continue;
+    }
+    if (result.status === "unconfirmed" && result.error) {
+      connectionFailures += 1;
+      disconnectedAt ||= Date.now();
+      onRunning(null, result.error);
+      if (Date.now() - disconnectedAt >= OPERATION_RECONNECT_LIMIT_MS) {
+        return {
+          status: "unconfirmed",
+          error: new Error("Margin's local service has been unreachable for one minute. Restart Margin to check the saved teacher receipt."),
+        };
+      }
+      await delay(Math.min(5000, 750 * connectionFailures));
+      continue;
+    }
+    return result;
+  }
+}
+
+function schedulePendingOperationReconciliation() {
+  clearTimeout(pendingReconciliationTimer);
+  if (!pendingOperations().length) return;
+  pendingReconciliationTimer = setTimeout(() => {
+    pendingReconciliationTimer = 0;
+    if (!state.activeRun && !state.newCourseRun) void reconcilePendingOperationsAtStartup();
+  }, 1000);
+}
+
+async function requestOperationCancellation(run, { courseId = "" } = {}) {
+  run.cancelRequested = true;
+  if (!run.operationId) {
+    run.controller?.abort();
+    return { status: "cancelling" };
+  }
+  const query = courseId ? `?course=${encodeURIComponent(courseId)}` : "";
+  return api(`/api/operations/${encodeURIComponent(run.operationId)}/cancel${query}`, {
+    method: "POST",
+    body: "{}",
+  });
 }
 
 function compactText(text) {
@@ -529,8 +593,9 @@ function renderNewCourseFormState() {
   const busy = Boolean(run);
   const cancelling = run?.phase === "cancelling";
   const opening = run?.phase === "opening";
+  const finishing = run?.phase === "committed";
   const provider = state.providers.find((item) => item.id === state.selectedTeacher);
-  const anotherTaskRunning = Boolean(state.activeRun || state.providerCheck);
+  const anotherTaskRunning = Boolean(state.activeRun);
   elements.newCourseForm.setAttribute("aria-busy", String(busy));
   elements.newCourseName.disabled = busy;
   elements.newCourseRequest.disabled = busy;
@@ -539,9 +604,11 @@ function renderNewCourseFormState() {
   elements.newCourseModelSelect.disabled = busy || !provider?.available;
   elements.newCourseEffortSelect.disabled = busy || !provider?.available;
   elements.createNewCourse.disabled = busy || anotherTaskRunning || !providerReady(provider);
-  elements.cancelNewCourse.disabled = cancelling || opening;
+  elements.cancelNewCourse.disabled = cancelling || opening || finishing;
   elements.cancelNewCourse.textContent = cancelling
     ? "Cancelling…"
+    : finishing
+      ? "Finishing…"
     : opening
       ? "Opening…"
       : busy
@@ -550,7 +617,7 @@ function renderNewCourseFormState() {
   const retrying = !elements.newCourseProgress.hidden
     && (elements.newCourseProgress.dataset.state === "error" || elements.newCourseProgress.dataset.state === "cancelled");
   elements.createNewCourse.textContent = busy
-    ? (opening ? "Opening lecture…" : cancelling ? "Cancelling…" : "Creating lecture…")
+    ? (opening ? "Opening lecture…" : cancelling ? "Cancelling…" : finishing ? "Finishing…" : "Creating lecture…")
     : (retrying ? "Try again" : "Create first lecture");
 }
 
@@ -580,10 +647,10 @@ function renderNewCourseTeacherFields(selectedProvider) {
     ...efforts.map((effort) => `<option value="${escapeHtml(effort)}">${escapeHtml(effort)}</option>`),
   ].join("");
   elements.newCourseEffortSelect.value = settings.effort;
-  elements.newCourseTeacherStatus.textContent = state.activeRun || state.providerCheck
+  elements.newCourseTeacherStatus.textContent = state.activeRun
     ? "Another teacher task is already running. You can create this course when it finishes."
     : selectedTeacherStatus(selectedProvider);
-  elements.newCourseTeacherStatus.dataset.state = providerReady(selectedProvider) && !state.activeRun && !state.providerCheck
+  elements.newCourseTeacherStatus.dataset.state = providerReady(selectedProvider) && !state.activeRun
     ? "ready"
     : "attention";
   elements.newCourseConfigHint.textContent = teacherConfigHint(selectedProvider);
@@ -594,15 +661,31 @@ function renderLibrary() {
   const courseCards = state.courses.map((course, index) => {
     const lectures = allLectures(course).length;
     return `
-      <button class="course-card course-tone-${index % 4}" type="button" data-course-id="${escapeHtml(course.id)}">
-        <span class="course-spine" aria-hidden="true"></span>
-        <strong>${escapeHtml(course.title)}</strong>
-        <small>${course.chapters.length} ${course.chapters.length === 1 ? "chapter" : "chapters"} · ${lectures} ${lectures === 1 ? "lecture" : "lectures"}</small>
-        <span class="course-open" aria-hidden="true">Open →</span>
-      </button>
+      <div class="course-card-shell">
+        <button class="course-card course-tone-${index % 4}" type="button" data-course-id="${escapeHtml(course.id)}">
+          <span class="course-spine" aria-hidden="true"></span>
+          <strong>${escapeHtml(course.title)}</strong>
+          <small>${course.chapters.length} ${course.chapters.length === 1 ? "chapter" : "chapters"} · ${lectures} ${lectures === 1 ? "lecture" : "lectures"}</small>
+          <span class="course-open" aria-hidden="true">Open →</span>
+        </button>
+        <button class="course-delete-trigger" type="button" data-delete-course="${escapeHtml(course.id)}"
+          aria-label="Delete ${escapeHtml(course.title)}" title="Delete course">Delete</button>
+      </div>
     `;
   }).join("");
-  elements.courseShelf.innerHTML = `${courseCards}
+  const brokenCards = state.diagnostics.map((diagnostic) => `
+    <div class="course-card-shell">
+      <div class="course-card course-card-broken">
+        <span class="course-spine" aria-hidden="true"></span>
+        <strong>${escapeHtml(diagnostic.id)}</strong>
+        <small>${escapeHtml(clip(diagnostic.error || "This course could not be read", 140))}</small>
+        <span class="course-open" aria-hidden="true">Unreadable</span>
+      </div>
+      <button class="course-delete-trigger" type="button" data-delete-course="${escapeHtml(diagnostic.id)}"
+        aria-label="Delete ${escapeHtml(diagnostic.id)}" title="Delete course">Delete</button>
+    </div>
+  `).join("");
+  elements.courseShelf.innerHTML = `${courseCards}${brokenCards}
     <button class="course-card new-course-card" type="button" data-new-course>
       <span class="new-course-card-plus" aria-hidden="true">+</span>
       <strong>New course</strong>
@@ -613,7 +696,130 @@ function renderLibrary() {
   for (const button of elements.courseShelf.querySelectorAll("[data-course-id]")) {
     button.addEventListener("click", () => openCourse(button.dataset.courseId));
   }
+  for (const button of elements.courseShelf.querySelectorAll("[data-delete-course]")) {
+    button.addEventListener("click", () => requestCourseDeletion(button.dataset.deleteCourse));
+  }
   elements.courseShelf.querySelector("[data-new-course]").addEventListener("click", openNewCourseDialog);
+}
+
+function deletionBlocked() {
+  if (!state.activeRun && !state.newCourseRun) return false;
+  showToast("Wait for the current teacher action to finish before deleting course material.", { error: true });
+  return true;
+}
+
+function showDeleteDialog(deletion) {
+  if (deletionBlocked()) return;
+  state.pendingDeletion = { ...deletion, busy: false };
+  elements.deleteError.hidden = true;
+  elements.deleteError.textContent = "";
+  elements.confirmDelete.disabled = false;
+  elements.cancelDelete.disabled = false;
+
+  if (deletion.kind === "course") {
+    elements.deleteTitle.textContent = `Delete ${deletion.title}?`;
+    elements.deleteDetail.textContent = "The course will disappear from your library, including every lecture and learning record.";
+    elements.deleteRecovery.textContent = "Margin moves the complete course folder into Margin Trash inside the library. Its files remain recoverable.";
+    elements.confirmDelete.textContent = "Delete course";
+  } else {
+    elements.deleteTitle.textContent = `Delete “${deletion.title}”?`;
+    elements.deleteDetail.textContent = "The lecture will be removed from its chapter together with its active margin notes.";
+    elements.deleteRecovery.textContent = "Margin archives the lecture HTML, its notes, and a deletion version inside the course’s private history.";
+    elements.confirmDelete.textContent = "Delete lecture";
+  }
+  elements.deleteDialog.showModal();
+  requestAnimationFrame(() => elements.cancelDelete.focus());
+}
+
+function requestCourseDeletion(courseId) {
+  const course = state.courses.find((candidate) => candidate.id === courseId);
+  const diagnostic = course ? null : state.diagnostics.find((candidate) => candidate.id === courseId);
+  if (!course && !diagnostic) return;
+  showDeleteDialog({ kind: "course", courseId, title: course?.title || courseId });
+}
+
+function requestLectureDeletion(lessonPath) {
+  const course = state.course;
+  const lectures = allLectures(course);
+  const lecture = lectures.find((candidate) => candidate.path === lessonPath);
+  if (!course || !lecture) return;
+  if (lectures.length <= 1) {
+    showToast("A course must keep one lecture. Delete the course instead.", { error: true });
+    return;
+  }
+  const index = lectures.findIndex((candidate) => candidate.path === lessonPath);
+  showDeleteDialog({
+    kind: "lecture",
+    courseId: course.id,
+    lesson: lessonPath,
+    title: lecture.title,
+    fallbackNextLesson: lectures[index + 1]?.path || lectures[index - 1]?.path || "",
+  });
+}
+
+function closeDeleteDialog({ force = false } = {}) {
+  if (state.pendingDeletion?.busy && !force) return;
+  if (elements.deleteDialog.open) elements.deleteDialog.close();
+  state.pendingDeletion = null;
+}
+
+async function performDeletion(event) {
+  event.preventDefault();
+  const deletion = state.pendingDeletion;
+  if (!deletion || deletion.busy) return;
+  deletion.busy = true;
+  elements.confirmDelete.disabled = true;
+  elements.cancelDelete.disabled = true;
+  elements.confirmDelete.textContent = "Moving…";
+  elements.deleteError.hidden = true;
+
+  try {
+    let result = null;
+    let requestError = null;
+    try {
+      result = deletion.kind === "course"
+        ? await api(`/api/courses/${encodeURIComponent(deletion.courseId)}`, { method: "DELETE" })
+        : await api(`/api/courses/${encodeURIComponent(deletion.courseId)}/lectures`, {
+          method: "DELETE",
+          body: JSON.stringify({ lesson: deletion.lesson }),
+        });
+    } catch (error) {
+      requestError = error;
+    }
+
+    const previousDocument = state.documentPath;
+    await refreshCourses();
+    const survivingCourse = state.courses.find((course) => course.id === deletion.courseId);
+    const survivingDiagnostic = state.diagnostics.some((diagnostic) => diagnostic.id === deletion.courseId);
+    const deletionConfirmed = deletion.kind === "course"
+      ? !survivingCourse && !survivingDiagnostic
+      : !survivingCourse || !allLectures(survivingCourse).some((lecture) => lecture.path === deletion.lesson);
+    if (requestError && !deletionConfirmed) throw requestError;
+
+    closeDeleteDialog({ force: true });
+    if (deletion.kind === "course") {
+      showLibrary();
+      showToast("Course moved to Margin Trash.");
+      return;
+    }
+
+    if (!survivingCourse) {
+      showLibrary();
+    } else {
+      const nextDocument = previousDocument === deletion.lesson
+        ? result?.nextLesson || deletion.fallbackNextLesson
+        : previousDocument;
+      await openCourse(deletion.courseId, nextDocument);
+    }
+    showToast("Lecture moved to course history.");
+  } catch (error) {
+    deletion.busy = false;
+    elements.confirmDelete.disabled = false;
+    elements.cancelDelete.disabled = false;
+    elements.confirmDelete.textContent = deletion.kind === "course" ? "Delete course" : "Delete lecture";
+    elements.deleteError.textContent = error.message;
+    elements.deleteError.hidden = false;
+  }
 }
 
 function openNewCourseDialog() {
@@ -633,13 +839,29 @@ function closeNewCourseDialog({ force = false } = {}) {
   if (elements.newCourseDialog.open) elements.newCourseDialog.close();
 }
 
-function cancelNewCourseCreation() {
+async function cancelNewCourseCreation() {
   const run = state.newCourseRun;
-  if (!run || run.phase !== "creating") return;
+  if (!run || !["creating", "running"].includes(run.phase)) return;
   run.phase = "cancelling";
-  setNewCourseProgress("running", "Cancelling course creation", "Stopping the teacher and closing the unfinished response…");
+  setNewCourseProgress("running", "Cancelling course creation", "Stopping the teacher and rolling back unfinished work…");
   renderNewCourseFormState();
-  run.controller.abort();
+  try {
+    const result = await requestOperationCancellation(run);
+    if (state.newCourseRun !== run) return;
+    if (result.status === "finishing" || result.status === "complete") {
+      run.phase = "committed";
+      setNewCourseProgress("running", "Finishing the lecture", "Final validation has begun; Margin will keep the result if it completes.");
+      renderNewCourseFormState();
+    }
+  } catch (error) {
+    if (state.newCourseRun === run) {
+      run.cancelRequested = false;
+      run.phase = "creating";
+      setNewCourseProgress("running", `${providerName(run.provider)} is preparing lecture 1`, "Teaching continues in the background.");
+      renderNewCourseFormState();
+    }
+    showToast(`Could not request cancellation: ${error.message}`, { error: true });
+  }
 }
 
 async function openCompletedCourse(completedEvent, run) {
@@ -685,7 +907,7 @@ async function createNewCourse(event) {
   const provider = state.selectedTeacher;
   const { model, effort } = { ...teacherSettings(provider) };
   const controller = new AbortController();
-  const run = { controller, phase: "creating", provider, model, effort, operationId: "" };
+  const run = { controller, phase: "creating", provider, model, effort, operationId: "", cancelRequested: false };
   state.newCourseRun = run;
   const configuration = [model || "default model", effort ? `${effort} thinking` : "default thinking"].join(" · ");
   setNewCourseProgress("running", `${providerName(provider)} is preparing lecture 1`, `Starting with ${configuration}…`);
@@ -739,6 +961,36 @@ async function createNewCourse(event) {
         } catch (openError) {
           error = openError;
         }
+      } else if (resolution.status === "running") {
+        setNewCourseProgress(
+          "running",
+          `${providerName(provider)} is still preparing lecture 1`,
+          "The activity stream changed, but teaching continues safely in the background.",
+        );
+        const terminal = await waitForOperationTerminal(operationId, {
+          onRunning: (_task, connectionError) => {
+            if (connectionError) {
+              setNewCourseProgress("running", "Reconnecting to the teacher", "The background task is safe; Margin is retrying its status connection.");
+            }
+          },
+        });
+        if (terminal.status === "complete") {
+          completedEvent = terminal.event;
+          committed = true;
+          await clearOperation(operationId);
+          try {
+            await openCompletedCourse(completedEvent, run);
+            return;
+          } catch (openError) {
+            error = openError;
+          }
+        } else if (terminal.status === "unknown") {
+          await clearOperation(operationId);
+        } else {
+          const detail = terminal.error ? ` ${terminal.error.message}` : "";
+          setNewCourseProgress("error", "Course result is not confirmed", `Margin could not confirm whether lecture 1 was saved.${detail}`);
+          return;
+        }
       } else if (resolution.status === "unknown") {
         await clearOperation(operationId);
       } else {
@@ -758,7 +1010,7 @@ async function createNewCourse(event) {
       return;
     }
     if (!controller.signal.aborted) controller.abort();
-    const cancelled = error.name === "AbortError" || controller.signal.aborted && state.newCourseRun?.phase === "cancelling";
+    const cancelled = run.cancelRequested || error.name === "AbortError";
     setNewCourseProgress(
       cancelled ? "cancelled" : "error",
       cancelled ? "Course creation cancelled" : "The first lecture was not created",
@@ -769,6 +1021,7 @@ async function createNewCourse(event) {
   } finally {
     if (state.newCourseRun?.controller === controller) state.newCourseRun = null;
     renderProviders();
+    schedulePendingOperationReconciliation();
   }
 }
 
@@ -818,6 +1071,7 @@ function toggleChapter(chapterId) {
 function renderCourseRail() {
   const course = state.course;
   if (!course) return;
+  const canDeleteLecture = allLectures(course).length > 1;
   elements.currentCourseTitle.textContent = course.title;
   elements.chapterList.innerHTML = course.chapters.map((chapter, chapterIndex) => `
     <section class="chapter-group" ${chapter.id === currentChapter()?.id ? 'data-current="true"' : ""}>
@@ -829,11 +1083,16 @@ function renderCourseRail() {
       </button>
       <div class="chapter-lectures" ${state.expandedChapterId === chapter.id ? "" : "hidden"}>
         ${chapter.lectures.map((lecture, lectureIndex) => `
-          <button class="lesson-link" type="button" data-document-path="${escapeHtml(lecture.path)}"
-            ${lecture.path === state.documentPath ? 'aria-current="page"' : ""}>
-            <span class="lesson-number">${String(lectureIndex + 1).padStart(2, "0")}</span>
-            <span class="lesson-name">${escapeHtml(lecture.title)}</span>
-          </button>
+          <div class="lesson-row">
+            <button class="lesson-link" type="button" data-document-path="${escapeHtml(lecture.path)}"
+              ${lecture.path === state.documentPath ? 'aria-current="page"' : ""}>
+              <span class="lesson-number">${String(lectureIndex + 1).padStart(2, "0")}</span>
+              <span class="lesson-name">${escapeHtml(lecture.title)}</span>
+            </button>
+            ${canDeleteLecture ? `<button class="lecture-delete-trigger" type="button"
+              data-delete-lecture="${escapeHtml(lecture.path)}" aria-label="Delete ${escapeHtml(lecture.title)}"
+              title="Delete lecture">×</button>` : ""}
+          </div>
         `).join("")}
       </div>
     </section>
@@ -848,6 +1107,9 @@ function renderCourseRail() {
   }
   for (const button of elements.chapterList.querySelectorAll("[data-document-path]")) {
     button.addEventListener("click", () => loadDocument(button.dataset.documentPath));
+  }
+  for (const button of elements.chapterList.querySelectorAll("[data-delete-lecture]")) {
+    button.addEventListener("click", () => requestLectureDeletion(button.dataset.deleteLecture));
   }
   for (const button of elements.referenceList.querySelectorAll("[data-document-path]")) {
     button.addEventListener("click", () => loadDocument(button.dataset.documentPath));
@@ -945,7 +1207,12 @@ function renderMessages() {
   }
 
   const provider = state.providers.find((item) => item.id === state.selectedTeacher);
-  const running = Boolean(state.activeRun || state.providerCheck || state.newCourseRun);
+  const running = Boolean(state.activeRun || state.newCourseRun);
+  const runBlocksNotes = Boolean(state.activeRun?.courseId) && state.activeRun.courseId === state.course?.id;
+  elements.saveMessage.disabled = runBlocksNotes;
+  elements.saveMessage.title = runBlocksNotes
+    ? "The teacher is working on this course. Your draft stays here and can be saved when it finishes."
+    : "";
   elements.reviseButton.disabled = running || !currentLesson() || !unusedLesson.length || !providerReady(provider);
   elements.nextButton.disabled = running || !currentLesson() || !providerReady(provider);
   elements.reviseDetail.textContent = unusedLesson.length === 1 ? "Uses 1 unused note" : `Uses ${unusedLesson.length} unused notes`;
@@ -963,8 +1230,8 @@ function renderProviders() {
   elements.teacherCurrentName.textContent = selectedName;
   elements.teacherCurrentConfig.textContent = selectedProvider ? teacherConfigSummary(selectedProvider) : "No CLI available";
   renderProviderGlyph(elements.teacherCurrentGlyph, selectedProvider);
-  const busy = Boolean(state.activeRun || state.providerCheck);
-  const updating = state.activeRun?.action === "update" || state.providerCheck;
+  const busy = Boolean(state.activeRun);
+  const updating = state.activeRun?.action === "update";
   elements.teacherMenuButton.disabled = !state.providers.length;
   elements.teacherMenuButton.title = selectedProvider?.error || providerStatus(selectedProvider);
   elements.teacherMenuButton.setAttribute("aria-expanded", String(state.teacherMenuOpen));
@@ -1060,12 +1327,19 @@ function reportCourseDiagnostics(diagnostics) {
   }
   if (signature === state.courseDiagnosticsSignature) return;
   state.courseDiagnosticsSignature = signature;
-  showToast(`${items.length} ${items.length === 1 ? "course" : "courses"} could not be opened.`, { error: true });
+  const names = items.map((item) => item?.id).filter(Boolean);
+  showToast(
+    names.length === 1
+      ? `Course “${names[0]}” could not be opened. It stays listed in the library so it can be deleted.`
+      : `${names.length} courses could not be opened: ${names.join(", ")}.`,
+    { error: true },
+  );
 }
 
 async function refreshCourses() {
   const payload = await api("/api/courses");
   state.courses = payload.courses;
+  state.diagnostics = Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
   state.course = state.courses.find((course) => course.id === state.course?.id) || state.courses[0] || null;
   renderLibrary();
   reportCourseDiagnostics(payload.diagnostics);
@@ -1078,6 +1352,14 @@ async function loadDocument(documentPath, {
 } = {}) {
   if (!state.course || !documentPath) return false;
   if (state.navigationGeneration !== navigationGeneration || state.course.id !== courseId) return false;
+  const allowedDocuments = new Set([
+    ...allLectures(state.course).map((item) => item.path),
+    ...(state.course.references || []).map((item) => item.path),
+  ]);
+  if (!allowedDocuments.has(documentPath)) {
+    showToast("This lecture link is not part of the selected course.", { error: true });
+    return false;
+  }
   hideSelectionPopover();
   closeComposer({ refreshLecture: false });
   state.documentPath = documentPath;
@@ -1089,7 +1371,13 @@ async function loadDocument(documentPath, {
   updateReaderMetadata();
   renderMessages();
   state.readerBridge = crypto.randomUUID();
-  elements.lessonFrame.src = `${contentOrigin}/course/${encodeURIComponent(state.course.id)}/${documentPath}?bridge=${encodeURIComponent(state.readerBridge)}&parent=${encodeURIComponent(window.location.origin)}&v=${Date.now()}${hash}`;
+  const encodedDocumentPath = documentPath.split("/").map(encodeURIComponent).join("/");
+  const frameUrl = new URL(`/course/${encodeURIComponent(state.course.id)}/${encodedDocumentPath}`, contentOrigin);
+  frameUrl.searchParams.set("bridge", state.readerBridge);
+  frameUrl.searchParams.set("parent", window.location.origin);
+  frameUrl.searchParams.set("v", String(Date.now()));
+  if (typeof hash === "string" && hash.startsWith("#") && hash.length <= 2048) frameUrl.hash = hash.slice(1);
+  elements.lessonFrame.src = frameUrl.href;
   refreshLectureHistory();
   return true;
 }
@@ -1350,7 +1638,7 @@ async function saveMessage() {
         quote: pending?.quote || "",
         message,
         anchor: pending?.anchor || null,
-        image: image ? { dataUrl: image.dataUrl } : undefined,
+        image: image ? { dataUrl: image.dataUrl, name: image.name } : undefined,
       }),
     });
     if (state.navigationGeneration !== navigationGeneration || state.course?.id !== courseId || state.documentPath !== lessonPath) {
@@ -1427,7 +1715,7 @@ function receiveReaderMessage(event) {
 }
 
 function chooseProvider(providerId) {
-  if (!state.providers.find((provider) => provider.id === providerId)?.available || state.activeRun?.action === "update" || state.providerCheck) return;
+  if (!state.providers.find((provider) => provider.id === providerId)?.available || state.activeRun?.action === "update") return;
   state.selectedTeacher = providerId;
   persistPreference("margin:teacher", providerId);
   renderProviders();
@@ -1629,7 +1917,7 @@ function selectedTeacherAnnotationIds(action, chapter, lesson) {
 }
 
 async function runTeacher(action) {
-  if (state.activeRun || state.providerCheck || !currentLesson()) return;
+  if (state.activeRun || !currentLesson()) return;
   const checkedProvider = state.providers.find((item) => item.id === state.selectedTeacher);
   if (!providerReady(checkedProvider)) {
     showToast(checkedProvider?.error || "The selected teacher is not ready.", { error: true });
@@ -1644,7 +1932,19 @@ async function runTeacher(action) {
   const { model, effort } = { ...teacherSettings(provider) };
   const annotationIds = selectedTeacherAnnotationIds(action, chapter, lesson);
   closeTeacherMenu();
-  const run = { controller, phase: "running", action, courseId, chapterId: chapter.id, lesson, provider, model, effort, operationId: "" };
+  const run = {
+    controller,
+    phase: "running",
+    action,
+    courseId,
+    chapterId: chapter.id,
+    lesson,
+    provider,
+    model,
+    effort,
+    operationId: "",
+    cancelRequested: false,
+  };
   state.activeRun = run;
   resetRunLog();
   elements.runTitle.textContent = `${providerName(provider)} · ${action === "revise" ? "revision" : "next lecture"}`;
@@ -1723,6 +2023,37 @@ async function runTeacher(action) {
         } catch (refreshError) {
           error = refreshError;
         }
+      } else if (resolution.status === "running") {
+        setRunState("running", "The activity stream changed; teaching continues safely in the background.");
+        const terminal = await waitForOperationTerminal(operationId, {
+          courseId,
+          onRunning: (_task, connectionError) => {
+            if (connectionError) setRunState("running", "Reconnecting to the background teacher…");
+          },
+        });
+        if (terminal.status === "complete") {
+          completedEvent = terminal.event;
+          committed = true;
+          if (state.activeRun?.controller === controller) state.activeRun.phase = "committed";
+          appendRunLog(completedEvent.text || "Teacher action completed.", "summary");
+          setRunState("done", action === "revise" ? "Lecture revised." : "Next lecture created.");
+          await clearOperation(operationId);
+          try {
+            await applyTeacherCompletion(run, completedEvent);
+            return;
+          } catch (refreshError) {
+            error = refreshError;
+          }
+        } else if (terminal.status === "unknown") {
+          await clearOperation(operationId);
+        } else {
+          const detail = terminal.error ? ` ${terminal.error.message}` : "";
+          const message = `Margin could not confirm whether the teacher saved its work.${detail}`;
+          appendRunLog(message, "summary");
+          setRunState("error", message);
+          showToast(message, { error: true });
+          return;
+        }
       } else if (resolution.status === "unknown") {
         await clearOperation(operationId);
       } else {
@@ -1742,7 +2073,7 @@ async function runTeacher(action) {
       return;
     }
     if (!controller.signal.aborted) controller.abort();
-    const message = error.name === "AbortError" ? "Teacher action cancelled." : error.message;
+    const message = run.cancelRequested || error.name === "AbortError" ? "Teacher action cancelled." : error.message;
     if (state.activeRun?.controller === controller) state.activeRun.phase = "settled";
     setRunState("error", message);
     showToast(message, { error: true });
@@ -1751,11 +2082,12 @@ async function runTeacher(action) {
     elements.cancelRun.disabled = false;
     if (elements.teacherRun.dataset.state !== "running") elements.cancelRun.textContent = "Dismiss";
     renderProviders();
+    schedulePendingOperationReconciliation();
   }
 }
 
 async function runProviderUpdate(provider) {
-  if (state.activeRun || state.providerCheck) return;
+  if (state.activeRun) return;
   const installed = state.providers.find((item) => item.id === provider);
   if (!installed?.available) {
     showToast(`${providerName(provider)} is not installed.`, { error: true });
@@ -1813,15 +2145,31 @@ async function runProviderUpdate(provider) {
     elements.cancelRun.disabled = false;
     if (elements.teacherRun.dataset.state !== "running") elements.cancelRun.textContent = "Dismiss";
     renderProviders();
+    schedulePendingOperationReconciliation();
   }
 }
 
-function cancelRun() {
+async function cancelRun() {
   if (state.activeRun?.action === "update") return;
   if (state.activeRun?.phase === "running") {
-    state.activeRun.phase = "cancelling";
-    setRunState("running", "Stopping the teacher and waiting for the response to close…");
-    state.activeRun.controller.abort();
+    const run = state.activeRun;
+    run.phase = "cancelling";
+    setRunState("running", "Stopping the teacher and rolling back unfinished work…");
+    try {
+      const result = await requestOperationCancellation(run, { courseId: run.courseId || "" });
+      if (state.activeRun !== run) return;
+      if (result.status === "finishing" || result.status === "complete") {
+        run.phase = "committed";
+        setRunState("running", "Final validation has begun; Margin will keep the result if it completes.");
+      }
+    } catch (error) {
+      if (state.activeRun === run) {
+        run.cancelRequested = false;
+        run.phase = "running";
+        setRunState("running", "Teaching continues in the background.");
+      }
+      showToast(`Could not request cancellation: ${error.message}`, { error: true });
+    }
   }
   else if (!state.activeRun) {
     closeRunDetails();
@@ -1846,11 +2194,130 @@ function applyPreferences(settings) {
   renderWorkspaceScale();
 }
 
+async function resumePendingTeacherOperation(entry, task = {}) {
+  const controller = new AbortController();
+  const provider = task.provider || entry.provider || state.selectedTeacher;
+  const run = {
+    controller,
+    phase: "running",
+    action: entry.action,
+    courseId: entry.courseId,
+    chapterId: entry.chapterId || "",
+    lesson: entry.lesson,
+    provider,
+    operationId: entry.id,
+    cancelRequested: false,
+    resumed: true,
+  };
+  state.activeRun = run;
+  await openCourse(entry.courseId, entry.lesson).catch((error) => {
+    showToast(`The teacher is still running, but its course could not be opened yet: ${error.message}`, { error: true });
+  });
+  resetRunLog();
+  elements.runTitle.textContent = `${providerName(provider)} · ${entry.action === "revise" ? "revision" : "next lecture"}`;
+  setRunState("running", task.notice || "Reconnected to a teacher already working in the background.");
+  if (task.notice) appendRunLog(task.notice, "status");
+  renderProviders();
+
+  try {
+    const result = await waitForOperationTerminal(entry.id, {
+      courseId: entry.courseId,
+      onRunning: (activeTask, connectionError) => {
+        if (connectionError) setRunState("running", "Reconnecting to the background teacher…");
+        else if (activeTask?.notice) {
+          setRunState("running", activeTask.notice);
+          appendRunLog(activeTask.notice, "status");
+        }
+      },
+    });
+    if (result.status === "complete") {
+      run.phase = "committed";
+      appendRunLog(result.event.text || "Teacher action completed.", "summary");
+      setRunState("done", entry.action === "revise" ? "Lecture revised." : "Next lecture created.");
+      await clearOperation(entry.id);
+      await applyTeacherCompletion(run, result.event);
+      return;
+    }
+    if (result.status === "unknown") {
+      await clearOperation(entry.id);
+      const message = run.cancelRequested ? "Teacher action cancelled." : "The unfinished teacher action stopped without saving a lecture.";
+      appendRunLog(message, "summary");
+      setRunState("error", message);
+    }
+  } catch (error) {
+    appendRunLog(error.message, "summary");
+    setRunState("error", error.message);
+    showToast(error.message, { error: true });
+  } finally {
+    if (state.activeRun === run) state.activeRun = null;
+    renderProviders();
+    schedulePendingOperationReconciliation();
+  }
+}
+
+async function resumePendingCourseCreation(entry, task = {}) {
+  const controller = new AbortController();
+  const provider = task.provider || entry.provider || state.selectedTeacher;
+  const run = {
+    controller,
+    phase: "running",
+    provider,
+    operationId: entry.id,
+    cancelRequested: false,
+    resumed: true,
+  };
+  state.newCourseRun = run;
+  elements.newCourseForm.reset();
+  resetNewCourseProgress();
+  renderProviders();
+  setNewCourseProgress(
+    "running",
+    `${providerName(provider)} is preparing lecture 1`,
+    task.notice || "Reconnected to course creation already running in the background.",
+  );
+  if (!elements.newCourseDialog.open) elements.newCourseDialog.showModal();
+
+  try {
+    const result = await waitForOperationTerminal(entry.id, {
+      onRunning: (activeTask, connectionError) => {
+        if (connectionError) {
+          setNewCourseProgress("running", "Reconnecting to the teacher", "The background task is safe; Margin is retrying its status connection.");
+        } else if (activeTask?.notice) {
+          setNewCourseProgress("running", `${providerName(provider)} is preparing lecture 1`, activeTask.notice);
+        }
+      },
+    });
+    if (result.status === "complete") {
+      run.phase = "committed";
+      await clearOperation(entry.id);
+      await openCompletedCourse(result.event, run);
+      return;
+    }
+    if (result.status === "unknown") {
+      await clearOperation(entry.id);
+      setNewCourseProgress(
+        run.cancelRequested ? "cancelled" : "error",
+        run.cancelRequested ? "Course creation cancelled" : "The first lecture was not created",
+        run.cancelRequested ? "The unfinished course was rolled back." : "The background teacher stopped without saving a lecture.",
+      );
+    }
+  } catch (error) {
+    setNewCourseProgress("error", "Course result could not be opened", error.message);
+    showToast(error.message, { error: true });
+  } finally {
+    if (state.newCourseRun === run) state.newCourseRun = null;
+    renderProviders();
+    schedulePendingOperationReconciliation();
+  }
+}
+
 async function reconcilePendingOperationsAtStartup() {
   const entries = pendingOperations();
   if (!entries.length) return;
   const remaining = [];
+  const running = [];
   let completed = 0;
+  let deferred = 0;
   let unconfirmed = 0;
   for (const entry of entries) {
     const result = await reconcileOperation(entry.id, {
@@ -1866,7 +2333,9 @@ async function reconcilePendingOperationsAtStartup() {
     }
     if (result.status === "unknown") continue;
     remaining.push(entry);
-    unconfirmed += 1;
+    if (result.status === "running") running.push({ entry, task: result.task });
+    else if (result.status === "deferred") deferred += 1;
+    else unconfirmed += 1;
   }
   if (remaining.length !== entries.length) {
     try {
@@ -1879,6 +2348,15 @@ async function reconcilePendingOperationsAtStartup() {
   if (completed) {
     await refreshCourses();
     showToast(`${completed} completed background teacher ${completed === 1 ? "result was" : "results were"} recovered.`);
+  }
+  if (running.length) {
+    const [{ entry, task }] = running;
+    showToast("Reconnected to the teacher working in the background.");
+    if (entry.kind === "course-create") void resumePendingCourseCreation(entry, task);
+    else void resumePendingTeacherOperation(entry, task);
+  } else if (deferred) {
+    showToast(`${deferred} pending teacher ${deferred === 1 ? "receipt will" : "receipts will"} be checked after the current task finishes.`);
+    schedulePendingOperationReconciliation();
   } else if (unconfirmed) {
     showToast(`${unconfirmed} teacher ${unconfirmed === 1 ? "result is" : "results are"} still unconfirmed; Margin kept the retry receipt.`, { error: true });
   }
@@ -1893,6 +2371,7 @@ async function init() {
     applyPreferences(bootstrap.settings);
     const [coursePayload, providerPayload] = await Promise.all([api("/api/courses"), api("/api/providers")]);
     state.courses = coursePayload.courses;
+    state.diagnostics = Array.isArray(coursePayload.diagnostics) ? coursePayload.diagnostics : [];
     state.providers = providerPayload.providers;
     renderLibrary();
     renderProviders();
@@ -1915,6 +2394,15 @@ elements.newCourseDialog.addEventListener("cancel", (event) => {
   if (!state.newCourseRun) return;
   event.preventDefault();
   cancelNewCourseCreation();
+});
+elements.deleteForm.addEventListener("submit", performDeletion);
+elements.cancelDelete.addEventListener("click", closeDeleteDialog);
+elements.deleteDialog.addEventListener("cancel", (event) => {
+  if (state.pendingDeletion?.busy) {
+    event.preventDefault();
+    return;
+  }
+  state.pendingDeletion = null;
 });
 elements.newCourseTeacherSelect.addEventListener("change", () => chooseProvider(elements.newCourseTeacherSelect.value));
 elements.newCourseModelSelect.addEventListener("change", () => chooseTeacherModel(elements.newCourseModelSelect.value.trim()));

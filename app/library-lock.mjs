@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, realpath, rename, stat, unlink } from "node:fs/promises";
@@ -85,6 +86,45 @@ function processIsAlive(pid) {
     if (error?.code === "EPERM") return true;
     throw error;
   }
+}
+
+function processCommand(pid) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    try {
+      execFile("ps", ["-p", String(pid), "-o", "comm="], { timeout: 2000 }, (error, stdout) => {
+        if (!error) {
+          const command = stdout.trim();
+          // An empty successful probe is not proof that the owner is gone.
+          return finish(command ? { found: true, command } : null);
+        }
+        // A numeric exit code means ps ran and found no such process. Other
+        // failures (permission, timeout, unavailable ps) stay conservative.
+        if (typeof error.code === "number" && error.code > 0) return finish({ found: false });
+        finish(null);
+      });
+    } catch {
+      // execFile can throw synchronously when process inspection is denied.
+      finish(null);
+    }
+  });
+}
+
+async function ownerIsAlive(pid) {
+  if (!processIsAlive(pid)) return false;
+  // A recycled PID can make a dead owner look alive forever. Only treat the
+  // owner as alive when the process is a plausible Margin backend; if ps is
+  // unavailable, stay conservative and honor the lock.
+  const probe = await processCommand(pid);
+  if (probe === null) return true;
+  if (!probe.found || !probe.command) return false;
+  const executable = path.basename(probe.command).toLowerCase();
+  return executable.includes("node") || executable.includes("margin");
 }
 
 async function unlinkIfSameLock(lockPath, canonicalRoot, expected) {
@@ -194,7 +234,7 @@ export async function acquireLibraryLock(libraryPath) {
 
     const existing = await readLock(lockPath, canonicalRoot);
     if (!existing) continue;
-    if (processIsAlive(existing.owner.pid)) throw lockedBy(existing.owner);
+    if (await ownerIsAlive(existing.owner.pid)) throw lockedBy(existing.owner);
 
     let recoveryIdentity;
     try {
@@ -203,7 +243,7 @@ export async function acquireLibraryLock(libraryPath) {
       if (error?.code !== "EEXIST") throw error;
       const recovery = await readLock(recoveryPath, canonicalRoot);
       if (!recovery) continue;
-      if (processIsAlive(recovery.owner.pid)) throw lockedBy(recovery.owner, "recovering");
+      if (await ownerIsAlive(recovery.owner.pid)) throw lockedBy(recovery.owner, "recovering");
       await unlinkIfSameLock(recoveryPath, canonicalRoot, recovery);
       continue;
     }
@@ -211,7 +251,7 @@ export async function acquireLibraryLock(libraryPath) {
     try {
       const current = await readLock(lockPath, canonicalRoot);
       if (!current) continue;
-      if (processIsAlive(current.owner.pid)) throw lockedBy(current.owner);
+      if (await ownerIsAlive(current.owner.pid)) throw lockedBy(current.owner);
       identity = await replaceLock(lockPath, owner);
       break;
     } finally {

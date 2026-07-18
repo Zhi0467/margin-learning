@@ -26,7 +26,7 @@ async function waitForLine(stream, expected) {
   throw new Error(`Child exited before writing ${expected}`);
 }
 
-function runContender(root, moduleUrl) {
+function runContender(root, moduleUrl, { env = {} } = {}) {
   const script = `
     import { acquireLibraryLock } from ${JSON.stringify(moduleUrl)};
     try {
@@ -40,6 +40,7 @@ function runContender(root, moduleUrl) {
   `;
   const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
     stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...env },
   });
   return new Promise((resolve, reject) => {
     let stdout = "";
@@ -69,6 +70,24 @@ test("holds one lock across canonical and symlinked library paths", async (t) =>
 
   const second = await acquireLibraryLock(root);
   assert.equal(await second.release(), true);
+});
+
+test("honors a live lock when process inspection returns no command", async (t) => {
+  const { parent, root } = await fixture(t);
+  const fakeBin = path.join(parent, "fake-bin");
+  await mkdir(fakeBin);
+  await writeFile(path.join(fakeBin, "ps"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const moduleUrl = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../library-lock.mjs")).href;
+  const first = await acquireLibraryLock(root);
+
+  try {
+    assert.equal(
+      await runContender(root, moduleUrl, { env: { PATH: fakeBin } }),
+      "MARGIN_LIBRARY_LOCKED",
+    );
+  } finally {
+    await first.release();
+  }
 });
 
 test("recovers a valid lock after its owner process dies", async (t) => {

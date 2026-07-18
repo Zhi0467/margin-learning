@@ -13,7 +13,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const TRANSACTION_DIRECTORY = ".margin-course-transactions";
 const METADATA_FILE = "transaction.json";
@@ -49,6 +49,28 @@ async function pathInfo(filename) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
+}
+
+async function ensureRegularDirectory(directory, label) {
+  let info = await pathInfo(directory);
+  if (!info) {
+    await mkdir(directory, { mode: 0o700 });
+    info = await lstat(directory);
+  }
+  if (info.isSymbolicLink() || !info.isDirectory() || await realpath(directory) !== directory) {
+    throw new Error(`${label} must be a regular directory`);
+  }
+  return directory;
+}
+
+async function archiveDisplacedCourse(handle) {
+  if (!(await pathInfo(handle.courseRoot))) return "";
+  const trashRoot = await ensureRegularDirectory(path.join(handle.workspaceRoot, ".margin-trash"), "Margin trash");
+  const conflictRoot = await ensureRegularDirectory(path.join(trashRoot, "guard-conflicts"), "Course conflict archive");
+  const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
+  const destination = path.join(conflictRoot, `${handle.courseId}--${timestamp}--${randomUUID()}`);
+  await rename(handle.courseRoot, destination);
+  return path.relative(handle.workspaceRoot, destination).split(path.sep).join("/");
 }
 
 async function directoryIdentity(filename, label) {
@@ -112,6 +134,9 @@ function validateMetadata(parsed, transactionId = "") {
     || typeof parsed.createdAt !== "string") {
     throw new Error("Invalid course transaction metadata");
   }
+  if (Object.hasOwn(parsed, "preserveDisplaced") && typeof parsed.preserveDisplaced !== "boolean") {
+    throw new Error("Invalid course transaction preservation mode");
+  }
   if (parsed.state !== "preparing") {
     if (typeof parsed.snapshotIdentity?.device !== "string" || typeof parsed.snapshotIdentity?.inode !== "string") {
       throw new Error("Invalid course transaction snapshot identity");
@@ -174,6 +199,32 @@ async function inspectCourseTree(physicalRoot, logicalRoot = physicalRoot) {
   return links;
 }
 
+async function courseTreeManifest(physicalRoot, logicalRoot = physicalRoot) {
+  const manifest = [];
+  const walk = async (directory, relativeDirectory = "") => {
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relative = relativeDirectory ? path.join(relativeDirectory, entry.name) : entry.name;
+      const filename = path.join(directory, entry.name);
+      const info = await lstat(filename);
+      if (info.isSymbolicLink()) {
+        manifest.push([relative, "link", await validateSymlink(filename, relative, physicalRoot, logicalRoot)]);
+      } else if (info.isDirectory()) {
+        manifest.push([relative, "directory"]);
+        await walk(filename, relative);
+      } else if (info.isFile()) {
+        const digest = createHash("sha256").update(await readFile(filename)).digest("hex");
+        manifest.push([relative, "file", info.size, digest]);
+      } else {
+        throw new Error(`Unsupported course filesystem entry: ${relative}`);
+      }
+    }
+  };
+  await walk(physicalRoot);
+  return manifest;
+}
+
 function sameLinks(left, right) {
   if (left.size !== right.size) return false;
   for (const [relative, target] of left) {
@@ -214,7 +265,9 @@ async function removeTransaction(transactionRoot) {
   }
 }
 
-export async function beginCourseTransaction(workspaceRoot, courseId, courseRoot = "") {
+export async function beginCourseTransaction(workspaceRoot, courseId, courseRoot = "", {
+  preserveDisplaced = false,
+} = {}) {
   const workspace = await canonicalWorkspaceRoot(workspaceRoot);
   const id = assertCourseId(courseId);
   const expectedCourseRoot = path.join(workspace, id);
@@ -242,6 +295,7 @@ export async function beginCourseTransaction(workspaceRoot, courseId, courseRoot
     courseId: id,
     state: "preparing",
     createdAt: new Date().toISOString(),
+    ...(preserveDisplaced ? { preserveDisplaced: true } : {}),
   };
   try {
     await writeMetadata(root, metadata);
@@ -284,6 +338,30 @@ export async function commitCourseTransaction(transaction, { cleanup = true } = 
   return { committed: true, cleanupPending };
 }
 
+export async function courseTransactionMatchesSnapshot(transaction) {
+  const { metadata, handle } = await loadTransaction(transaction);
+  if (metadata.state !== "pending") throw new Error("Only a pending course transaction can be compared");
+  const snapshotRoot = path.join(handle.transactionRoot, SNAPSHOT_DIRECTORY);
+  const snapshotIdentity = await directoryIdentity(snapshotRoot, "The course snapshot");
+  if (!identityMatches(snapshotIdentity, metadata.snapshotIdentity)) {
+    throw new Error("The course snapshot identity changed");
+  }
+
+  const liveInfo = await pathInfo(handle.courseRoot);
+  if (!liveInfo || liveInfo.isSymbolicLink() || !liveInfo.isDirectory()) return false;
+  const snapshot = await courseTreeManifest(snapshotRoot, handle.courseRoot);
+  let live;
+  try {
+    live = await courseTreeManifest(handle.courseRoot);
+  } catch {
+    // Unsafe links and unreadable live artifacts are mismatches. The caller
+    // should choose rollback; corruption in the protected snapshot still
+    // throws above.
+    return false;
+  }
+  return JSON.stringify(live) === JSON.stringify(snapshot);
+}
+
 export async function rollbackCourseTransaction(transaction, { renameEntry = rename } = {}) {
   const { metadata, handle } = await loadTransaction(transaction);
   if (metadata.state === "committed") throw new Error("A committed course transaction cannot be rolled back");
@@ -299,6 +377,7 @@ export async function rollbackCourseTransaction(transaction, { renameEntry = ren
   let snapshotInfo = await pathInfo(snapshotRoot);
   let courseInfo = await pathInfo(handle.courseRoot);
   let failedInfo = await pathInfo(failedRoot);
+  let archived = "";
 
   if (!snapshotInfo) {
     const currentIdentity = courseInfo && courseInfo.isDirectory() && !courseInfo.isSymbolicLink()
@@ -316,9 +395,13 @@ export async function rollbackCourseTransaction(transaction, { renameEntry = ren
     if (failedInfo && courseInfo) throw new Error("Course rollback has ambiguous live and quarantined state");
 
     if (!failedInfo && courseInfo) {
-      await renameEntry(handle.courseRoot, failedRoot);
+      if (metadata.preserveDisplaced) {
+        archived = await archiveDisplacedCourse(handle);
+      } else {
+        await renameEntry(handle.courseRoot, failedRoot);
+        failedInfo = await pathInfo(failedRoot);
+      }
       courseInfo = null;
-      failedInfo = await pathInfo(failedRoot);
     }
 
     try {
@@ -352,7 +435,8 @@ export async function rollbackCourseTransaction(transaction, { renameEntry = ren
   }
 
   await writeMetadata(handle.transactionRoot, { ...metadata, state: "rolled-back" });
-  return { restored: true, cleanupPending: await removeTransaction(handle.transactionRoot) };
+  const result = { restored: true, cleanupPending: await removeTransaction(handle.transactionRoot) };
+  return archived ? { ...result, archived } : result;
 }
 
 export async function recoverCourseTransactions(workspaceRoot) {
@@ -385,8 +469,13 @@ export async function recoverCourseTransactions(workspaceRoot) {
 
     const handle = transactionHandle(workspace, metadata);
     if (metadata.state === "pending") {
-      await rollbackCourseTransaction(handle);
-      result.restored.push(metadata.courseId);
+      if (metadata.preserveDisplaced && await courseTransactionMatchesSnapshot(handle)) {
+        await commitCourseTransaction(handle);
+        result.cleaned.push(entry.name);
+      } else {
+        await rollbackCourseTransaction(handle);
+        result.restored.push(metadata.courseId);
+      }
     } else {
       await rm(root, { recursive: true, force: true });
       result.cleaned.push(entry.name);

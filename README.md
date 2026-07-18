@@ -9,7 +9,7 @@ Learning and teaching are asynchronous. Reading never starts a background
 agent, and leaving a note never claims that something was learned. A teacher
 runs only when you click a teaching action.
 
-> **Developer beta:** Margin 0.1.0 is an unsigned, Apple Silicon-only build for
+> **Developer beta:** Margin 0.1.1 is an unsigned, Apple Silicon-only build for
 > macOS 13 or newer. Expect rough edges and read the permissions section before
 > using a teacher.
 
@@ -21,7 +21,10 @@ runs only when you click a teaching action.
 - Anchors text and image notes to lecture passages.
 - Supports Claude Code and Codex, including model and reasoning-effort choices.
 - Runs teacher work in the background while the library remains usable.
+- Keeps that work alive across a WebView reload or activity-stream disconnect;
+  only an explicit cancellation, app quit, or library change stops it.
 - Tracks content-addressed lecture versions and supports restoration.
+- Deletes courses and lectures recoverably into library or course-local trash.
 - Commits each teaching action transactionally across the lecture and any
   supporting course-local data, with crash recovery for unfinished actions.
 - Reconciles interrupted responses through durable operation receipts so a
@@ -35,7 +38,7 @@ runs only when you click a teaching action.
 
 ## Install the GitHub beta
 
-1. Download `Margin-0.1.0-macos-arm64.zip` and `SHA256SUMS` from the latest
+1. Download `Margin-0.1.1-macos-arm64.zip` and `SHA256SUMS` from the latest
    GitHub Release.
 2. Optionally verify the download:
 
@@ -55,6 +58,11 @@ Do not bypass Gatekeeper for a binary whose source or checksum you do not trust.
 
 On first launch, choose or create a learning-library folder. Margin remembers
 the folder and can change it later from the application menu.
+
+Only one Margin app can open a given learning library at a time. If you are
+testing the release beside Margin Dev, quit Margin Dev before opening the same
+library, or choose a different library. This lock prevents two teacher actions
+from changing the same course concurrently.
 
 ## Teachers
 
@@ -79,9 +87,27 @@ When you start a teaching action, the selected CLI receives write access to the
 entire learning library you chose, not just the visible lecture. This is
 intentional: a teacher may update directly requested supporting course state
 such as vocabulary databases, notes, learning records, references, assets, or
-resource lists. The prompt confines the action to the selected course, while
-Margin verifies the strict lecture invariant and protects app-owned
-`COURSE.json` and `.learn/` history.
+resource lists, and may build course-local or library-level utilities in service
+of long-term teaching. The teaching action is centered on the selected course.
+Margin verifies its strict lecture invariant, protects app-owned `COURSE.json`
+and `.learn/` history, and transactionally restores changes made to any other
+recognized course directory it can safely snapshot. If a course contains an
+unsafe or unreadable entry, Margin reports that the course was skipped instead
+of blocking an unrelated teaching action. If a protected course changes while
+the teacher runs, Margin restores the snapshot and preserves the displaced copy
+under `.margin-trash/guard-conflicts/` so concurrent edits are recoverable.
+
+Library-level utilities are intentionally outside the recognized-course guard.
+They are allowed because the teacher has full write access within the selected
+learning root; keep durable course-specific state inside its course directory
+when you want transactional restoration.
+
+Closing or reloading the reader does not cancel a teacher. Margin reconnects to
+the durable operation receipt and keeps showing a background spinner. The
+Cancel button requests rollback explicitly. If the local service stays
+unreachable for a minute, Margin stops the spinner, keeps the receipt, and asks
+you to restart so it can check the result. Quitting, restarting, or changing the
+library while a teacher is active asks for confirmation first.
 
 Use a dedicated learning-library folder. Do not select a directory containing
 unrelated private or valuable files.
@@ -101,6 +127,12 @@ and [examples/demo-course](examples/demo-course) for a complete minimal course.
 
 Margin stores annotations and lecture history under each course's ignored
 `.learn/` directory. Those files are learner data, not application source.
+
+Deleting is recoverable. A deleted course moves into `.margin-trash/` inside
+the selected library. A deleted lecture is removed from `COURSE.json` and
+archived with its margin notes and deletion version under the course's private
+`.learn/trash/` directory. Margin will not delete the final lecture in a course;
+delete the course instead.
 
 ## Development
 

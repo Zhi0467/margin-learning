@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { lstat, mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 
 const COURSE_ID = /^[a-zA-Z0-9_-]+$/;
 const CHAPTER_ID = /^[a-z0-9][a-z0-9-]*$/;
@@ -24,11 +24,11 @@ export function htmlText(value = "") {
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, "&")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -254,6 +254,28 @@ export function safeCoursePath(workspaceRoot, courseId, relativePath = "") {
   return candidate;
 }
 
+export async function moveCourseToTrash(workspaceRoot, courseId) {
+  const libraryRoot = await realpath(path.resolve(workspaceRoot));
+  const source = path.join(libraryRoot, assertCourseId(courseId));
+  const sourceInfo = await lstat(source);
+  if (sourceInfo.isSymbolicLink() || !sourceInfo.isDirectory() || await realpath(source) !== source) {
+    throw new Error("Invalid course directory");
+  }
+
+  const trashRoot = path.join(libraryRoot, ".margin-trash");
+  await ensureRegularDirectory(trashRoot, "Margin trash");
+  if (await realpath(trashRoot) !== trashRoot) throw new Error("Invalid Margin trash directory");
+
+  const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
+  const archiveName = `${courseId}--${timestamp}--${crypto.randomUUID()}`;
+  const destination = path.join(trashRoot, archiveName);
+  await rename(source, destination);
+  return {
+    courseId,
+    archive: path.relative(libraryRoot, destination).split(path.sep).join("/"),
+  };
+}
+
 async function lessonMetadata(courseRoot, filename) {
   const html = await readFile(path.join(courseRoot, "lessons", filename), "utf8");
   const titleMatch = html.match(/<title>([\s\S]*?)<\/title>/i);
@@ -376,7 +398,7 @@ export async function discoverCoursesDetailed(workspaceRoot) {
   const courses = [];
   const diagnostics = [];
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "app") continue;
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const courseRoot = path.join(workspaceRoot, entry.name);
     try {
       const [mission, structure, referenceEntries] = await Promise.all([
@@ -546,6 +568,9 @@ export async function addAnnotation(workspaceRoot, courseId, input) {
   const quote = boundedString(input.quote ?? "", "Selected passage", 8000, { allowEmpty: true });
   const message = boundedString(input.message ?? "", "Message", 12000, { allowEmpty: true });
   const parsedImage = input.image == null ? null : parseImageDataUrl(input.image);
+  const imageName = parsedImage
+    ? boundedString(input.image.name ?? "", "Image name", 240, { allowEmpty: true }).trim()
+    : "";
   if (!message.trim() && !parsedImage) throw new Error("Message or image is required");
   const anchor = input.anchor && typeof input.anchor === "object" ? input.anchor : null;
   const annotation = {
@@ -562,7 +587,7 @@ export async function addAnnotation(workspaceRoot, courseId, input) {
       endOffset: Number.isInteger(anchor.endOffset) ? anchor.endOffset : 0,
       blockId: typeof anchor.blockId === "string" ? anchor.blockId.slice(0, 200) : "",
     } : null,
-    ...(parsedImage ? { image: { type: parsedImage.type, bytes: parsedImage.data.length } } : {}),
+    ...(parsedImage ? { image: { type: parsedImage.type, bytes: parsedImage.data.length, ...(imageName ? { name: imageName } : {}) } } : {}),
     createdAt: new Date().toISOString(),
     uses: [],
   };
@@ -959,10 +984,201 @@ export async function recordLectureVersion(courseRoot, lesson, metadata = {}) {
   return { ...commit };
 }
 
+export async function archiveLecture(courseRoot, lesson) {
+  const selectedLesson = assertLessonPath(lesson);
+  const canonicalCourseRoot = await realpath(path.resolve(courseRoot));
+  const courseId = assertCourseId(path.basename(canonicalCourseRoot));
+  const workspaceRoot = path.dirname(canonicalCourseRoot);
+  const structure = await readCourseStructure(canonicalCourseRoot);
+  if (structure.lectures.length <= 1) {
+    throw Object.assign(
+      new Error("The last lecture cannot be deleted. Delete the course instead."),
+      { status: 409 },
+    );
+  }
+
+  const chapterIndex = structure.chapters.findIndex((chapter) => (
+    chapter.lectures.some((candidate) => candidate.path === selectedLesson)
+  ));
+  if (chapterIndex < 0) throw Object.assign(new Error("Lecture not found"), { code: "ENOENT" });
+  const chapter = structure.chapters[chapterIndex];
+  const lectureIndex = chapter.lectures.findIndex((candidate) => candidate.path === selectedLesson);
+  const flatIndex = structure.lectures.findIndex((candidate) => candidate.path === selectedLesson);
+  const nextLesson = structure.lectures[flatIndex + 1]?.path || structure.lectures[flatIndex - 1]?.path || "";
+  const source = path.join(canonicalCourseRoot, selectedLesson);
+  const sourceInfo = await lstat(source);
+  if (sourceInfo.isSymbolicLink() || !sourceInfo.isFile()) throw new Error("Invalid lecture file");
+
+  let ledger = await seedLectureHistory(canonicalCourseRoot);
+  const content = await readFile(source);
+  const deletion = await appendLectureCommit(canonicalCourseRoot, ledger, selectedLesson, content, {
+    action: "delete",
+    provider: "margin",
+    model: "",
+    effort: "",
+  }, { force: true });
+  if (deletion.added) await writeLectureLedger(canonicalCourseRoot, ledger);
+
+  const learnRoot = path.join(canonicalCourseRoot, ".learn");
+  await ensureRegularDirectory(learnRoot, "lecture history");
+  const trashRoot = path.join(learnRoot, "trash");
+  await ensureRegularDirectory(trashRoot, "lecture trash");
+  const lectureTrashRoot = path.join(trashRoot, "lectures");
+  await ensureRegularDirectory(lectureTrashRoot, "lecture trash");
+  const deletedAt = new Date().toISOString();
+  const archiveName = `${path.basename(selectedLesson, ".html")}--${deletedAt.replace(/[.:]/g, "-")}--${crypto.randomUUID()}`;
+  const archiveRoot = path.join(lectureTrashRoot, archiveName);
+  await mkdir(archiveRoot, { mode: 0o700 });
+
+  const store = await readAnnotationStore(workspaceRoot, courseId);
+  const annotations = store.annotations.filter((annotation) => annotation.lesson === selectedLesson);
+  const archivedImagesRoot = path.join(archiveRoot, "annotation-images");
+  for (const annotation of annotations) {
+    if (!annotation.image) continue;
+    await ensureRegularDirectory(archivedImagesRoot, "archived annotation image");
+    const sourceDirectory = annotationImageDirectory(workspaceRoot, courseId, annotation.id);
+    const imageInfo = await lstat(sourceDirectory);
+    if (imageInfo.isSymbolicLink() || !imageInfo.isDirectory()) throw new Error("Invalid annotation image directory");
+    await rename(sourceDirectory, path.join(archivedImagesRoot, annotation.id));
+  }
+  store.annotations = store.annotations.filter((annotation) => annotation.lesson !== selectedLesson);
+  await writeAnnotationStore(workspaceRoot, courseId, store);
+
+  const manifest = structure.manifestText
+    ? JSON.parse(structure.manifestText)
+    : {
+      version: 1,
+      chapters: structure.chapters.map((item) => ({
+        id: item.id,
+        title: item.title,
+        description: item.description,
+        lectures: item.lectures.map((lecture) => lecture.path),
+      })),
+    };
+  const manifestChapter = manifest.chapters[chapterIndex];
+  manifestChapter.lectures = manifestChapter.lectures.filter((candidate) => candidate !== selectedLesson);
+  const removedChapter = manifestChapter.lectures.length === 0;
+  if (removedChapter) manifest.chapters.splice(chapterIndex, 1);
+
+  await rename(source, path.join(archiveRoot, "lecture.html"));
+  await writeFile(path.join(archiveRoot, "deletion.json"), `${JSON.stringify({
+    version: 1,
+    deletedAt,
+    lesson: selectedLesson,
+    chapter: { id: chapter.id, title: chapter.title, index: chapterIndex },
+    lectureIndex,
+    annotations,
+    historyCommit: deletion.commit.id,
+  }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  await writeManifestText(canonicalCourseRoot, `${JSON.stringify(manifest, null, 2)}\n`);
+  await readCourseStructure(canonicalCourseRoot);
+
+  return {
+    lesson: selectedLesson,
+    nextLesson,
+    removedChapter,
+    archive: path.relative(canonicalCourseRoot, archiveRoot).split(path.sep).join("/"),
+    lectureVersion: { ...deletion.commit },
+  };
+}
+
 export async function findLectureOperation(courseRoot, operationId) {
   assertLectureOperationId(operationId);
   const found = lectureOperationInLedger(await readLectureLedger(courseRoot, { validateObjects: false }), operationId);
   return found ? { lesson: found.lesson, commit: { ...found.commit } } : null;
+}
+
+export async function findCourseCreationReceipt(courseRoot, operationId = "") {
+  const requestedOperation = operationId ? assertLectureOperationId(operationId) : "";
+  const ledger = await readLectureLedger(courseRoot);
+  let found = null;
+  for (const [lesson, entry] of Object.entries(ledger.lectures)) {
+    for (const commit of entry.commits) {
+      if (commit.operationAction !== "course-create") continue;
+      if (requestedOperation && commit.operationId !== requestedOperation) continue;
+      if (found) throw new Error("A course draft contains multiple creation receipts");
+      found = { lesson, commit: { ...commit } };
+    }
+  }
+  return found;
+}
+
+async function archiveRecoveredDraft(libraryRoot, draftRoot) {
+  const trashRoot = path.join(libraryRoot, ".margin-trash");
+  await ensureRegularDirectory(trashRoot, "Margin trash");
+  if (await realpath(trashRoot) !== trashRoot) throw new Error("Invalid Margin trash directory");
+  const recoveryRoot = path.join(trashRoot, "recovered-drafts");
+  await ensureRegularDirectory(recoveryRoot, "recovered course draft");
+  if (await realpath(recoveryRoot) !== recoveryRoot) throw new Error("Invalid recovered course draft directory");
+  const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
+  const destination = path.join(recoveryRoot, `${path.basename(draftRoot)}--${timestamp}--${crypto.randomUUID()}`);
+  await rename(draftRoot, destination);
+  return path.relative(libraryRoot, destination).split(path.sep).join("/");
+}
+
+export async function recoverCourseCreationArtifacts(workspaceRoot, {
+  operationId = "",
+  archiveIncomplete = true,
+} = {}) {
+  if (operationId) assertLectureOperationId(operationId);
+  const libraryRoot = await realpath(path.resolve(workspaceRoot));
+  const entries = (await readdir(libraryRoot, { withFileTypes: true }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const removedLocks = [];
+  const recoveredCourses = [];
+  const archivedDrafts = [];
+
+  for (const entry of entries) {
+    if (!/^\.margin-course-id-[a-zA-Z0-9_-]+\.lock$/.test(entry.name)) continue;
+    const filename = path.join(libraryRoot, entry.name);
+    const info = await lstat(filename);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Unsafe stale course id lock: ${entry.name}`);
+    await unlink(filename);
+    removedLocks.push(entry.name);
+  }
+
+  for (const entry of entries) {
+    if (!entry.name.startsWith(".margin-course-draft-")) continue;
+    const draftRoot = path.join(libraryRoot, entry.name);
+    const info = await lstat(draftRoot);
+    if (info.isSymbolicLink() || !info.isDirectory() || await realpath(draftRoot) !== draftRoot) {
+      throw new Error(`Unsafe course draft: ${entry.name}`);
+    }
+
+    try {
+      let receipt;
+      try {
+        receipt = await findCourseCreationReceipt(draftRoot, operationId);
+      } catch (error) {
+        // A status lookup for one operation must not be broken by an unrelated,
+        // unfinished draft. Full startup recovery still archives and reports it.
+        if (operationId) continue;
+        throw error;
+      }
+      if (!receipt) {
+        if (!operationId && archiveIncomplete) archivedDrafts.push(await archiveRecoveredDraft(libraryRoot, draftRoot));
+        continue;
+      }
+      const structure = await readCourseStructure(draftRoot);
+      if (!structure.lectures.some((lecture) => lecture.path === receipt.lesson)) {
+        throw new Error("The completed course draft receipt references a missing lecture");
+      }
+      const current = await readFile(path.join(draftRoot, receipt.lesson));
+      if (crypto.createHash("sha256").update(current).digest("hex") !== receipt.commit.hash) {
+        throw new Error("The completed course draft changed after its creation receipt");
+      }
+      const mission = await readFile(path.join(draftRoot, "MISSION.md"), "utf8");
+      const title = mission.match(/^# Mission:\s*(.+)$/m)?.[1]?.trim() || "";
+      if (!title) throw new Error("The completed course draft has no mission title");
+      const promoted = await promoteCourseWorkspace(libraryRoot, draftRoot, courseIdBase(title));
+      recoveredCourses.push({ ...promoted, operationId: receipt.commit.operationId, lesson: receipt.lesson });
+    } catch (error) {
+      if (operationId || !archiveIncomplete) throw error;
+      archivedDrafts.push(await archiveRecoveredDraft(libraryRoot, draftRoot));
+    }
+  }
+
+  return { removedLocks, recoveredCourses, archivedDrafts };
 }
 
 function lectureHistoryView(lesson, entry) {
@@ -1277,11 +1493,22 @@ const PROVIDER_PROBES = {
   },
 };
 
+const PROVIDER_ENVIRONMENT_KEYS = new Set([
+  "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR", "TMP", "TEMP",
+  // Proxy and trust-store settings; without them, probes and teachers fail on
+  // networks where the same CLI works in the user's terminal.
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+  "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+]);
+const PROVIDER_ENVIRONMENT_PREFIXES = ["LC_", "ANTHROPIC_", "OPENAI_", "CLAUDE_", "CODEX_"];
+
 export function providerEnvironment(source = process.env) {
   const kept = {};
   for (const [key, value] of Object.entries(source)) {
-    if (key === "PATH" || key === "HOME" || key === "USER" || key === "SHELL" || key === "LANG" || key === "TERM"
-      || key === "TMPDIR" || key === "TMP" || key === "TEMP" || key.startsWith("LC_")) kept[key] = value;
+    if (PROVIDER_ENVIRONMENT_KEYS.has(key) || PROVIDER_ENVIRONMENT_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      kept[key] = value;
+    }
   }
   return { ...kept, NO_COLOR: "1", FORCE_COLOR: "0" };
 }
@@ -1443,8 +1670,10 @@ async function probeProviderInfo(provider) {
     }
   }
   const ready = compatibility.compatible && authenticated;
+  const providerLabel = provider === "claude" ? "Claude Code" : "Codex";
+  const version = `${versionResult.stdout || versionResult.stderr || ""}`.trim().split("\n").at(-1) || "";
   const error = !compatibility.compatible
-    ? `Update required; missing ${compatibility.missing.join(", ")}`
+    ? `This ${providerLabel} version does not support ${compatibility.missing.join(", ")}. Update ${providerLabel}, or update Margin if the CLI is already current.`
     : !authenticated
       ? `Sign in with ${provider === "claude" ? "claude auth login" : "codex login"}`
       : "";
@@ -1454,7 +1683,7 @@ async function probeProviderInfo(provider) {
     compatible: compatibility.compatible,
     authenticated,
     ready,
-    version: `${versionResult.stdout || versionResult.stderr || ""}`.trim().split("\n").at(-1) || "",
+    version,
     error,
     ...metadata,
   };
@@ -1509,7 +1738,6 @@ function claudeToolActivity(tool) {
   if (lower === "grep") return `Searched ${providerPath(input.path) || "the course"}${input.pattern ? ` for ${quotedActivityValue(input.pattern)}` : ""}`;
   if (lower === "edit" || lower === "multiedit" || lower === "notebookedit") return `Edited ${filename || "a course artifact"}`;
   if (lower === "write") return `Wrote ${filename || "a course artifact"}`;
-  if (lower === "bash") return "Ran a workspace check";
   if (lower === "websearch" || lower === "webfetch") return "Checked a source";
   if (lower === "todowrite") return "Updated the work plan";
   return name ? `Used ${name}` : "Worked on the course";

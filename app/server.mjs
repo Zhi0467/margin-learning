@@ -7,6 +7,7 @@ import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, wr
 
 import {
   addAnnotation,
+  archiveLecture,
   appendLectureToChapter,
   assertCourseId,
   assertLessonPath,
@@ -17,6 +18,7 @@ import {
   fileExists,
   findLectureOperation,
   markAnnotationsUsed,
+  moveCourseToTrash,
   normalizeProviderOptions,
   parseProviderLine,
   promoteCourseWorkspace,
@@ -25,6 +27,7 @@ import {
   providerEnvironment,
   providerInfo,
   providerUpdateCommand,
+  recoverCourseCreationArtifacts,
   readAnnotationImage,
   readAnnotationStore,
   readCourseStructure,
@@ -42,6 +45,7 @@ import { acquireLibraryLock } from "./library-lock.mjs";
 import {
   beginCourseTransaction,
   commitCourseTransaction,
+  courseTransactionMatchesSnapshot,
   recoverCourseTransactions,
   rollbackCourseTransaction,
 } from "./course-transaction.mjs";
@@ -56,6 +60,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4177);
 const CONTENT_PORT = Number(process.env.MARGIN_CONTENT_PORT || 0);
 const STATE_ROOT = path.resolve(process.env.MARGIN_STATE_ROOT || path.join(WORKSPACE_ROOT, ".margin-state"));
+const ACTIVE_TEACHER_TASK_FILE = path.join(STATE_ROOT, ".active-teacher-task.json");
 const BODY_LIMIT = 1024 * 1024;
 const ANNOTATION_BODY_LIMIT = 8 * 1024 * 1024;
 const RUN_EVENT_TEXT_LIMIT = 16 * 1024;
@@ -184,7 +189,9 @@ function reserveTeacherTask(request, response, details) {
     cancelReason: "",
     responseEnding: false,
     released: false,
+    markerOwned: false,
     stopPromise: null,
+    startedAt: new Date().toISOString(),
     cancelledPromise: new Promise((resolve) => { resolveCancelled = resolve; }),
     settled: new Promise((resolve) => { resolveSettled = resolve; }),
   };
@@ -197,32 +204,23 @@ function reserveTeacherTask(request, response, details) {
     void quiesceTaskProcessGroup(task);
     return true;
   };
-  const onRequestAborted = () => cancel("Teacher request was cancelled.");
-  const onRequestClose = () => {
-    if (request.aborted || !request.complete) cancel("Teacher request closed before it completed.");
-  };
-  const onResponseClose = () => {
-    if (!task.responseEnding && !response.writableEnded) cancel("Teacher response was closed.");
-  };
-  request.once("aborted", onRequestAborted);
-  request.once("close", onRequestClose);
-  response.once("close", onResponseClose);
-
   task.cancel = cancel;
   task.setChild = (child) => {
     task.child = child;
     if (task.cancelled) void quiesceTaskProcessGroup(task);
   };
   task.throwIfCancelled = (message = "Teacher action was cancelled.") => {
-    if (request.aborted || !request.complete || response.destroyed) cancel(message);
     if (task.cancelled) throw new Error(task.cancelReason || message);
   };
-  task.release = () => {
+  task.release = async () => {
     if (task.released) return;
     task.released = true;
-    request.removeListener("aborted", onRequestAborted);
-    request.removeListener("close", onRequestClose);
-    response.removeListener("close", onResponseClose);
+    if (task.markerOwned) {
+      await clearActiveTeacherMarker().catch((error) => {
+        console.error(`Could not clear the active teacher marker: ${error.message}`);
+      });
+      task.markerOwned = false;
+    }
     if (activeTask === task) activeTask = null;
     resolveSettled();
   };
@@ -239,6 +237,13 @@ async function claimOperationTask(request, response, details) {
     if (!running) {
       const task = reserveTeacherTask(request, response, details);
       activeTask = task;
+      try {
+        await writeActiveTeacherMarker(task);
+        task.markerOwned = true;
+      } catch (error) {
+        await task.release();
+        throw error;
+      }
       return task;
     }
     if (running.operationId !== details.operationId) {
@@ -281,6 +286,12 @@ export function launchReadyLine(host, port, contentOrigin, sessionToken = "") {
   return `MARGIN_READY ${url.href}`;
 }
 
+export function startupExitStatus(error) {
+  // EX_TEMPFAIL gives the native shell a stable, non-private signal that the
+  // selected library is healthy but already owned by another Margin process.
+  return error?.code === "MARGIN_LIBRARY_LOCKED" ? 75 : 1;
+}
+
 function isLoopbackHost(value) {
   try {
     const hostname = new URL(`http://${value}`).hostname;
@@ -303,9 +314,18 @@ function tokenMatches(request, token) {
 
 export { providerEnvironment };
 
-async function readSettings() {
+function libraryScopedSetting(key) {
+  return key === "margin:pending-operations" || key === "margin:course" || key.startsWith("margin:document:");
+}
+
+async function librarySettingsFile() {
+  const canonicalRoot = await realpath(WORKSPACE_ROOT);
+  const libraryId = createHash("sha256").update(canonicalRoot).digest("hex");
+  return path.join(STATE_ROOT, "libraries", libraryId, "settings.json");
+}
+
+async function readSettingsFile(filename) {
   try {
-    const filename = path.join(STATE_ROOT, "settings.json");
     const info = await lstat(filename);
     if (!info.isFile() || info.isSymbolicLink()) return {};
     const parsed = JSON.parse(await readFile(filename, "utf8"));
@@ -316,10 +336,10 @@ async function readSettings() {
   }
 }
 
-async function writeSettings(value) {
-  await mkdir(STATE_ROOT, { recursive: true });
-  const filename = path.join(STATE_ROOT, "settings.json");
-  const temporary = path.join(STATE_ROOT, `.settings-${process.pid}-${randomUUID()}.tmp`);
+async function writeSettingsFile(filename, value) {
+  const directory = path.dirname(filename);
+  await mkdir(directory, { recursive: true });
+  const temporary = path.join(directory, `.settings-${process.pid}-${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode: 0o600 });
     await rename(temporary, filename);
@@ -328,6 +348,68 @@ async function writeSettings(value) {
     await rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
+}
+
+async function readSettings() {
+  const globalFile = path.join(STATE_ROOT, "settings.json");
+  const libraryFile = await librarySettingsFile();
+  const [globalSettings, librarySettings] = await Promise.all([
+    readSettingsFile(globalFile),
+    readSettingsFile(libraryFile),
+  ]);
+  const legacyEntries = Object.entries(globalSettings).filter(([key]) => libraryScopedSetting(key));
+  if (legacyEntries.length) {
+    const migratedLibrary = { ...Object.fromEntries(legacyEntries), ...librarySettings };
+    const migratedGlobal = Object.fromEntries(
+      Object.entries(globalSettings).filter(([key]) => !libraryScopedSetting(key)),
+    );
+    await writeSettingsFile(libraryFile, migratedLibrary);
+    await writeSettingsFile(globalFile, migratedGlobal);
+    return { ...migratedGlobal, ...migratedLibrary };
+  }
+  return { ...globalSettings, ...librarySettings };
+}
+
+async function writeSetting(key, value) {
+  const filename = libraryScopedSetting(key)
+    ? await librarySettingsFile()
+    : path.join(STATE_ROOT, "settings.json");
+  const settings = await readSettingsFile(filename);
+  settings[key] = value;
+  await writeSettingsFile(filename, settings);
+  return readSettings();
+}
+
+function activeTeacherDetails(task) {
+  return {
+    version: 1,
+    operationId: task.operationId,
+    action: task.action,
+    provider: task.provider,
+    courseId: task.courseId || "",
+    chapterId: task.chapterId || "",
+    lesson: task.lesson || "",
+    startedAt: task.startedAt,
+    notice: task.guardNotice || "",
+  };
+}
+
+async function writeActiveTeacherMarker(task) {
+  await mkdir(STATE_ROOT, { recursive: true });
+  const temporary = path.join(STATE_ROOT, `.active-teacher-${process.pid}-${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, `${JSON.stringify(activeTeacherDetails(task), null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    await rename(temporary, ACTIVE_TEACHER_TASK_FILE);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function clearActiveTeacherMarker() {
+  await unlink(ACTIVE_TEACHER_TASK_FILE).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
 }
 
 async function readProviderIcon(provider) {
@@ -369,7 +451,11 @@ async function readJson(request, limit = BODY_LIMIT) {
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch (error) {
+    throw Object.assign(new Error("The request body must be valid JSON"), { status: 400, cause: error });
+  }
 }
 
 function originAllowed(request) {
@@ -391,14 +477,16 @@ function publicPath(relativePath) {
   return target;
 }
 
-async function serveFile(response, filename, { cache = false } = {}) {
+async function serveFile(response, filename) {
   const info = await stat(filename);
   if (!info.isFile()) throw Object.assign(new Error("Not found"), { code: "ENOENT" });
   const type = MIME.get(path.extname(filename).toLowerCase()) || "application/octet-stream";
+  // Interface assets are tiny loopback responses. no-store keeps a restarted or
+  // updated app from pairing a fresh server with stale cached scripts.
   response.writeHead(200, {
     "Content-Type": type,
     "Content-Length": info.size,
-    "Cache-Control": cache ? "public, max-age=300" : "no-store",
+    "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
   });
   response.end(await readFile(filename));
@@ -522,6 +610,129 @@ async function verifiedCourseRoot(courseId) {
     throw error;
   }
   return courseRoot;
+}
+
+async function protectedCourseIds() {
+  const { courses, diagnostics } = await discoverCoursesDetailed(WORKSPACE_ROOT);
+  const ids = new Set();
+  for (const candidate of [...courses, ...diagnostics]) {
+    try {
+      ids.add(assertCourseId(candidate.id));
+    } catch {
+      // Non-course application directories and malformed names are outside the
+      // course integrity boundary. Valid course ids, including unreadable
+      // courses reported as diagnostics, remain protected.
+    }
+  }
+  return ids;
+}
+
+async function beginOtherCourseGuard(selectedCourseId = "") {
+  const initialIds = await protectedCourseIds();
+  const transactions = [];
+  const skipped = [];
+  for (const courseId of [...initialIds].sort()) {
+    if (courseId === selectedCourseId) continue;
+    const courseRoot = path.join(WORKSPACE_ROOT, courseId);
+    try {
+      transactions.push({
+        courseId,
+        transaction: await beginCourseTransaction(WORKSPACE_ROOT, courseId, courseRoot, { preserveDisplaced: true }),
+      });
+    } catch (error) {
+      skipped.push({ courseId, reason: boundedEventText(error.message, 300) });
+    }
+  }
+  return { selectedCourseId, initialIds, transactions, skipped, closing: false, closed: false };
+}
+
+async function refreshOtherCourseGuardEntry(guard, courseId, mutation) {
+  const entry = guard && !guard.closing && !guard.closed
+    ? guard.transactions.find((item) => item.courseId === courseId)
+    : null;
+  if (!entry) return mutation();
+  if (!(await courseTransactionMatchesSnapshot(entry.transaction))) {
+    throw operationConflict("This course changed while the teacher is working; try again after the action finishes.");
+  }
+  const result = await mutation();
+  // Fold the app's own write into the protected snapshot so the guard does not
+  // later mistake it for teacher tampering and revert it.
+  const previous = entry.transaction;
+  entry.transaction = await beginCourseTransaction(WORKSPACE_ROOT, courseId, path.join(WORKSPACE_ROOT, courseId), {
+    preserveDisplaced: true,
+  });
+  await commitCourseTransaction(previous);
+  return result;
+}
+
+function annotationsLockedByActiveTask(courseId) {
+  return Boolean(activeTask && activeTask.courseId === courseId);
+}
+
+function guardedAnnotationMutation(courseId, mutation) {
+  return mutateAnnotations(() => refreshOtherCourseGuardEntry(activeTask?.otherCourseGuard, courseId, mutation));
+}
+
+function otherCourseGuardNotice(guard) {
+  if (!guard?.skipped?.length) return "";
+  const courses = guard.skipped.map((entry) => `${entry.courseId} (${entry.reason})`).join(", ");
+  const target = guard.skipped.length === 1 ? "that course" : "those courses";
+  return `Margin could not transactionally protect ${courses}. Teaching will continue, but changes to ${target} cannot be restored automatically.`;
+}
+
+function otherCourseChangeNotice(result) {
+  const courseIds = [
+    ...result.changed.map((entry) => entry.courseId),
+    ...result.quarantined.map((entry) => entry.courseId),
+  ].sort();
+  if (!courseIds.length) return "";
+  const archives = [
+    ...result.changed.map((entry) => entry.archive),
+    ...result.quarantined.map((entry) => entry.archive),
+  ].filter(Boolean);
+  const archiveText = archives.length ? ` Recoverable changed copies are in ${archives.join(", ")}.` : "";
+  return `Another recognized course changed while teaching was running (${courseIds.join(", ")}). Margin restored its protected state.${archiveText}`;
+}
+
+async function closeOtherCourseGuard(guard) {
+  if (!guard || guard.closed) return { changed: [], quarantined: [] };
+  guard.closing = true;
+  const changed = [];
+  const quarantined = [];
+  const errors = [];
+  const remainingTransactions = [];
+
+  const currentIds = await protectedCourseIds();
+  const addedIds = [...currentIds]
+    .filter((courseId) => !guard.initialIds.has(courseId) && courseId !== guard.selectedCourseId)
+    .sort();
+  for (const courseId of addedIds) {
+    try {
+      const result = await moveCourseToTrash(WORKSPACE_ROOT, courseId);
+      quarantined.push({ courseId, archive: result.archive });
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+
+  for (const entry of guard.transactions) {
+    try {
+      if (await courseTransactionMatchesSnapshot(entry.transaction)) {
+        await commitCourseTransaction(entry.transaction);
+      } else {
+        const rollback = await rollbackCourseTransaction(entry.transaction);
+        changed.push({ courseId: entry.courseId, archive: rollback.archived || "" });
+      }
+    } catch (error) {
+      errors.push(error);
+      remainingTransactions.push(entry);
+    }
+  }
+  guard.transactions = remainingTransactions;
+  guard.closed = errors.length === 0;
+
+  if (errors.length) throw new AggregateError(errors, "Could not close the other-course integrity guard");
+  return { changed, quarantined, skipped: guard.skipped };
 }
 
 async function regularDirectoryIdentity(directory, label) {
@@ -710,7 +921,7 @@ export function boundedEventText(value, limit = RUN_EVENT_TEXT_LIMIT) {
 
 function writeStreamEvent(response, event) {
   const bounded = typeof event.text === "string" ? { ...event, text: boundedEventText(event.text) } : event;
-  if (!response.destroyed) response.write(`${JSON.stringify(bounded)}\n`);
+  if (!response.destroyed && !response.writableEnded) response.write(`${JSON.stringify(bounded)}\n`);
 }
 
 function attachLineParser(stream, onLine) {
@@ -936,12 +1147,28 @@ function streamOperationComplete(response, event) {
 }
 
 async function operationStatus(id, courseId = "") {
-  if (activeTask?.operationId === id) return { status: "running" };
-  let found;
+  if (activeTask) {
+    if (activeTask.operationId === id) {
+      if (activeTask.completeEvent) return { status: "complete", event: activeTask.completeEvent };
+      return { status: "running", task: activeTeacherDetails(activeTask) };
+    }
+    return { status: "deferred", task: activeTeacherDetails(activeTask) };
+  }
+  let courseRoot = "";
   if (courseId) {
-    const courseRoot = await verifiedCourseRoot(assertCourseId(courseId));
+    try {
+      courseRoot = await verifiedCourseRoot(assertCourseId(courseId));
+    } catch (error) {
+      // A receipt whose course was deleted or is unreadable must still resolve,
+      // otherwise it can never be cleared. Fall back to the workspace search.
+      if (error?.code !== "ENOENT" && error.message !== "Unknown teaching workspace") throw error;
+    }
+  }
+  let found;
+  if (courseRoot) {
     found = await findLectureOperation(courseRoot, id);
   } else {
+    await recoverCourseCreationArtifacts(WORKSPACE_ROOT, { operationId: id, archiveIncomplete: false });
     found = await findWorkspaceOperation(id);
   }
   return found
@@ -982,7 +1209,7 @@ async function runProviderUpdate(request, response, provider, {
   try {
     const installed = await providerLookup(provider);
     if (!installed.available) throw new Error(`${provider === "claude" ? "Claude Code" : "Codex"} is not installed`);
-    task.throwIfCancelled("Update request closed before it started");
+    task.throwIfCancelled("Update was cancelled before it started");
     const spec = providerUpdateCommand(provider);
 
     response.writeHead(200, {
@@ -1026,7 +1253,7 @@ async function runProviderUpdate(request, response, provider, {
     }
   } finally {
     task.endResponse();
-    task.release();
+    await task.release();
   }
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
@@ -1048,6 +1275,8 @@ async function runCourseCreation(request, response, body, {
   let draft = null;
   let draftIdentity = null;
   let promoted = null;
+  let draftComplete = false;
+  let otherCourseGuard = null;
   let throwAfterCleanup = null;
   try {
     const replay = assertOperationReplay(
@@ -1056,6 +1285,8 @@ async function runCourseCreation(request, response, body, {
       operation.requestHash,
     );
     if (replay) {
+      task.cancellable = false;
+      task.completeEvent = replay;
       task.responseEnding = true;
       streamOperationComplete(response, replay);
       return;
@@ -1064,11 +1295,15 @@ async function runCourseCreation(request, response, body, {
     if (!installed.available) throw new Error(`${providerName(provider)} is not available on PATH`);
     if (!installed.compatible || !installed.authenticated) throw new Error(installed.error || "The selected teacher is not ready");
     const providerOptions = normalizeProviderOptions(provider, { model: body.model, effort: body.effort }, installed.models);
-    task.throwIfCancelled("Course creation request closed before it started");
+    task.throwIfCancelled("Course creation was cancelled before it started");
 
     draft = await createCourseWorkspace(WORKSPACE_ROOT, body);
     task.courseId = draft.id;
     task.courseRoot = draft.root;
+    otherCourseGuard = await mutateAnnotations(() => beginOtherCourseGuard());
+    task.otherCourseGuard = otherCourseGuard;
+    task.guardNotice = otherCourseGuardNotice(otherCourseGuard);
+    if (task.guardNotice) console.error(task.guardNotice);
     const courseIdentity = await captureCourseIdentity(draft.root);
     draftIdentity = courseIdentity;
     const structure = await readCourseStructure(draft.root, { allowEmptyChapters: true });
@@ -1103,6 +1338,7 @@ async function runCourseCreation(request, response, body, {
       effort: providerOptions.effort,
       text: `${providerName(provider)} is writing the first lecture`,
     });
+    if (task.guardNotice) writeStreamEvent(response, { type: "status", text: task.guardNotice });
 
     const child = spawnProcess(spec.command, spec.args, {
       cwd: spec.cwd,
@@ -1127,7 +1363,8 @@ async function runCourseCreation(request, response, body, {
       const text = line.trim();
       if (text && !text.startsWith("WARNING: proceeding")) lastDiagnostic = boundedEventText(text, 1000);
     });
-    child.stdin.once("error", () => task.cancel("Teacher input closed unexpectedly."));
+    let inputError = null;
+    child.stdin.once("error", (error) => { inputError = error; });
     child.stdin.end(prompt);
     const outcome = await waitForTeacherProcess(child, task);
     task.throwIfCancelled("Course creation was cancelled.");
@@ -1136,9 +1373,15 @@ async function runCourseCreation(request, response, body, {
       const failure = outcome.signal ? "Course creation was cancelled." : `${providerName(provider)} exited with code ${outcome.code}.`;
       throw new Error(lastDiagnostic ? `${failure} ${lastDiagnostic}` : failure);
     }
+    if (inputError) throw new Error(`The teacher did not accept its input: ${inputError.message}`);
     if (terminalState !== "success") {
       throw new Error(`${providerName(provider)} ended without confirming a successful turn`);
     }
+    const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
+    otherCourseGuard = null;
+    task.otherCourseGuard = null;
+    const otherCoursesNotice = otherCourseChangeNotice(guardResult);
+    if (otherCoursesNotice) writeStreamEvent(response, { type: "status", text: otherCoursesNotice });
 
     const lesson = await validateFirstLectureDraft(draft.root, {
       courseIdentity,
@@ -1148,6 +1391,7 @@ async function runCourseCreation(request, response, body, {
     task.throwIfCancelled("Course creation was cancelled.");
     await appendLectureToChapter(draft.root, "foundations", lesson, manifestSnapshot);
     task.throwIfCancelled("Course creation was cancelled.");
+    task.cancellable = false;
     const lectureVersion = await recordLectureVersion(draft.root, lesson, {
       action: "create",
       provider,
@@ -1157,6 +1401,8 @@ async function runCourseCreation(request, response, body, {
       operationAction: "course-create",
       requestHash: operation.requestHash,
     });
+    draftComplete = true;
+    task.lesson = lesson;
     const finalStructure = await readCourseStructure(draft.root);
     const referenceEntries = await readdir(path.join(draft.root, "reference"), { withFileTypes: true });
     const course = {
@@ -1173,28 +1419,31 @@ async function runCourseCreation(request, response, body, {
     await assertCourseIdentity(draft.root, courseIdentity);
     task.throwIfCancelled("Course creation was cancelled.");
     promoted = await promoteCourseWorkspace(WORKSPACE_ROOT, draft.root, draft.id);
-    task.throwIfCancelled("Course creation was cancelled.");
     course.id = promoted.id;
+    task.courseId = promoted.id;
     task.responseEnding = true;
-    writeStreamEvent(response, {
+    task.completeEvent = {
       type: "complete",
       operationId: operation.operationId,
       course,
       lesson,
       lectureVersion,
-      text: lastMessage || "Course and first lecture created.",
-    });
+      text: [lastMessage || "Course and first lecture created.", otherCoursesNotice].filter(Boolean).join(" "),
+    };
+    writeStreamEvent(response, task.completeEvent);
   } catch (error) {
     let text = error.message;
-    if (task.cancelled && promoted && draft) {
+    if (otherCourseGuard) {
       try {
-        await rename(promoted.root, draft.root);
-        promoted = null;
-      } catch (rollbackError) {
-        text += ` Course publication cleanup also failed: ${rollbackError.message}`;
+        const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
+        const changeNotice = otherCourseChangeNotice(guardResult);
+        if (changeNotice) text += ` ${changeNotice}`;
+        otherCourseGuard = null;
+      } catch (guardError) {
+        text += ` Other-course cleanup also failed: ${guardError.message}`;
       }
     }
-    if (!promoted && draft && draftIdentity) {
+    if (!promoted && !draftComplete && draft && draftIdentity) {
       try {
         await assertCourseIdentity(draft.root, draftIdentity);
         if (path.dirname(draft.root) !== WORKSPACE_ROOT || !path.basename(draft.root).startsWith(".margin-course-draft-")) {
@@ -1212,7 +1461,7 @@ async function runCourseCreation(request, response, body, {
     }
   } finally {
     task.endResponse();
-    task.release();
+    await task.release();
   }
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
@@ -1254,6 +1503,7 @@ async function runTeacher(request, response, body, {
   let lectureHistorySnapshot = null;
   let learnerStateSnapshot = null;
   let courseTransaction = null;
+  let otherCourseGuard = null;
 
   const rollback = async () => {
     if (courseTransaction) {
@@ -1282,6 +1532,8 @@ async function runTeacher(request, response, body, {
       operation.requestHash,
     );
     if (replay) {
+      task.cancellable = false;
+      task.completeEvent = replay;
       task.responseEnding = true;
       streamOperationComplete(response, replay);
       return;
@@ -1323,9 +1575,13 @@ async function runTeacher(request, response, body, {
     await seedLectureHistory(courseRoot, lessonSnapshot);
     lectureHistorySnapshot = await snapshotLectureHistoryStore(courseRoot);
     learnerStateSnapshot = await snapshotAppOwnedLearnerState(courseRoot);
-    task.throwIfCancelled("Teacher request closed before it started");
+    task.throwIfCancelled("Teacher action was cancelled before it started");
+    otherCourseGuard = await mutateAnnotations(() => beginOtherCourseGuard(courseId));
+    task.otherCourseGuard = otherCourseGuard;
+    task.guardNotice = otherCourseGuardNotice(otherCourseGuard);
+    if (task.guardNotice) console.error(task.guardNotice);
     courseTransaction = await beginCourseTransaction(WORKSPACE_ROOT, courseId, courseRoot);
-    task.throwIfCancelled("Teacher request closed before it started");
+    task.throwIfCancelled("Teacher action was cancelled before it started");
 
     const prompt = buildTeacherPrompt({
       action,
@@ -1355,6 +1611,7 @@ async function runTeacher(request, response, body, {
       annotationCount: annotations.length,
       text: `${provider === "claude" ? "Claude Code" : "Codex"} is ${action === "revise" ? "revising this lecture" : "writing the next lecture"}`,
     });
+    if (task.guardNotice) writeStreamEvent(response, { type: "status", text: task.guardNotice });
 
     const child = spawnProcess(spec.command, spec.args, {
       cwd: spec.cwd,
@@ -1382,7 +1639,8 @@ async function runTeacher(request, response, body, {
         lastDiagnostic = boundedEventText(text, 1000);
       }
     });
-    child.stdin.once("error", () => task.cancel("Teacher input closed unexpectedly."));
+    let inputError = null;
+    child.stdin.once("error", (error) => { inputError = error; });
     child.stdin.end(prompt);
     const outcome = await waitForTeacherProcess(child, task);
     task.throwIfCancelled("Teacher action was cancelled.");
@@ -1391,9 +1649,15 @@ async function runTeacher(request, response, body, {
       const failure = outcome.signal ? "Teacher action was cancelled." : `${providerName(provider)} exited with code ${outcome.code}.`;
       throw new Error(lastDiagnostic ? `${failure} ${lastDiagnostic}` : failure);
     }
+    if (inputError) throw new Error(`The teacher did not accept its input: ${inputError.message}`);
     if (terminalState !== "success") {
       throw new Error(`${providerName(provider)} ended without confirming a successful turn`);
     }
+    const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
+    otherCourseGuard = null;
+    task.otherCourseGuard = null;
+    const otherCoursesNotice = otherCourseChangeNotice(guardResult);
+    if (otherCoursesNotice) writeStreamEvent(response, { type: "status", text: otherCoursesNotice });
     await assertCourseIdentity(courseRoot, courseIdentity);
     if (!(await appOwnedLearnerStateMatches(courseRoot, learnerStateSnapshot))) {
       throw new Error("The teacher modified app-owned learner notes, images, or history");
@@ -1423,6 +1687,7 @@ async function runTeacher(request, response, body, {
     }
 
     task.throwIfCancelled("Teacher action was cancelled.");
+    task.cancellable = false;
     const lectureVersion = await recordLectureVersion(courseRoot, resultLesson, {
       action: action === "next" ? "create" : action,
       provider,
@@ -1445,15 +1710,29 @@ async function runTeacher(request, response, body, {
     lectureHistorySnapshot = null;
     learnerStateSnapshot = null;
     task.responseEnding = true;
-    writeStreamEvent(response, {
+    task.completeEvent = {
       type: "complete",
       operationId: operation.operationId,
       lesson: resultLesson,
       lectureVersion,
-      text: lastMessage || (action === "revise" ? "Lecture revised." : "Next lecture created."),
-    });
+      text: [
+        lastMessage || (action === "revise" ? "Lecture revised." : "Next lecture created."),
+        otherCoursesNotice,
+      ].filter(Boolean).join(" "),
+    };
+    writeStreamEvent(response, task.completeEvent);
   } catch (error) {
     let text = error.message;
+    if (otherCourseGuard) {
+      try {
+        const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
+        const changeNotice = otherCourseChangeNotice(guardResult);
+        if (changeNotice) text += ` ${changeNotice}`;
+        otherCourseGuard = null;
+      } catch (guardError) {
+        text += ` Other-course cleanup also failed: ${guardError.message}`;
+      }
+    }
     try {
       await rollback();
     } catch (rollbackError) {
@@ -1466,15 +1745,18 @@ async function runTeacher(request, response, body, {
     }
   } finally {
     task.endResponse();
-    task.release();
+    await task.release();
   }
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
 
 function isLibraryMutation(request, pathname) {
+  // Annotation routes are deliberately absent: notes stay writable while a
+  // teacher works, guarded per course in their handlers.
   if (request.method === "POST" && (pathname === "/api/courses" || pathname === "/api/courses/create")) return true;
-  if (request.method === "POST" && /^\/api\/courses\/[^/]+\/(?:history\/restore|annotations)$/.test(pathname)) return true;
-  return request.method === "DELETE" && /^\/api\/courses\/[^/]+\/annotations\/[^/]+$/.test(pathname);
+  if (request.method === "POST" && /^\/api\/courses\/[^/]+\/history\/restore$/.test(pathname)) return true;
+  if (request.method !== "DELETE") return false;
+  return /^\/api\/courses\/[^/]+(?:\/lectures)?$/.test(pathname);
 }
 
 async function handleRequest(request, response, {
@@ -1505,19 +1787,33 @@ async function handleRequest(request, response, {
       sendJson(response, 200, await operationStatus(operationId(operationMatch[1]), url.searchParams.get("course") || ""));
       return;
     }
+    const operationCancelMatch = request.method === "POST" && pathname.match(/^\/api\/operations\/([^/]+)\/cancel$/);
+    if (operationCancelMatch) {
+      const id = operationId(operationCancelMatch[1]);
+      if (activeTask?.operationId === id) {
+        if (activeTask.completeEvent) {
+          sendJson(response, 200, { status: "complete", event: activeTask.completeEvent });
+          return;
+        }
+        const cancelled = activeTask.cancel?.("Teacher action was cancelled by the learner.") || false;
+        sendJson(response, 202, { ok: cancelled, status: cancelled ? "cancelling" : "finishing" });
+        return;
+      }
+      const status = await operationStatus(id, url.searchParams.get("course") || "");
+      sendJson(response, status.status === "unknown" ? 404 : 200, status);
+      return;
+    }
     if (pathname === "/api/settings" && request.method === "PATCH") {
       const body = await readJson(request);
       if (typeof body.key !== "string" || !body.key.startsWith("margin:")
         || !["string", "number", "boolean"].includes(typeof body.value)) {
         throw new Error("A valid preference is required");
       }
-      const settings = await readSettings();
-      settings[body.key] = body.value;
-      sendJson(response, 200, { settings: await writeSettings(settings) });
+      sendJson(response, 200, { settings: await writeSetting(body.key, body.value) });
       return;
     }
-    if (["revise", "next", "create"].includes(activeTask?.action) && isLibraryMutation(request, pathname)) {
-      sendJson(response, 409, { error: "Course changes wait until the teacher finishes." });
+    if (activeTask && isLibraryMutation(request, pathname)) {
+      sendJson(response, 409, { error: "Course changes wait until the current action finishes." });
       return;
     }
   }
@@ -1553,21 +1849,65 @@ async function handleRequest(request, response, {
     return;
   }
 
-  const historyContentMatch = pathname.match(/^\/api\/courses\/([^/]+)\/history\/content$/);
-  if (historyContentMatch && request.method === "GET") {
-    const courseRoot = await verifiedCourseRoot(historyContentMatch[1]);
-    const lesson = url.searchParams.get("lesson") || "";
-    const commit = url.searchParams.get("commit") || "";
-    if (!lesson || !commit) throw new Error("Lecture and commit are required");
-    const content = await readLectureVersionContent(courseRoot, lesson, commit);
-    response.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8",
-      "Content-Length": content.length,
-      "Cache-Control": "no-store",
-      "Content-Security-Policy": "sandbox allow-scripts; default-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'",
-      "X-Content-Type-Options": "nosniff",
-    });
-    response.end(content);
+  const lectureDeleteMatch = pathname.match(/^\/api\/courses\/([^/]+)\/lectures$/);
+  if (lectureDeleteMatch && request.method === "DELETE") {
+    const body = await readJson(request);
+    if (activeTask) {
+      sendJson(response, 409, { error: "Another course action is already running." });
+      return;
+    }
+    const courseId = assertCourseId(lectureDeleteMatch[1]);
+    const reservation = { child: null, action: "delete-lecture", courseId };
+    activeTask = reservation;
+    let transaction = null;
+    try {
+      await annotationMutation;
+      const courseRoot = await verifiedCourseRoot(courseId);
+      transaction = await beginCourseTransaction(WORKSPACE_ROOT, courseId, courseRoot);
+      const result = await archiveLecture(courseRoot, body.lesson);
+      await commitCourseTransaction(transaction);
+      transaction = null;
+      sendJson(response, 200, { ok: true, ...result });
+    } catch (error) {
+      if (transaction) {
+        try {
+          await rollbackCourseTransaction(transaction);
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], `Lecture deletion failed and rollback also failed: ${rollbackError.message}`);
+        }
+      }
+      throw error;
+    } finally {
+      if (activeTask === reservation) activeTask = null;
+    }
+    return;
+  }
+
+  const courseDeleteMatch = pathname.match(/^\/api\/courses\/([^/]+)$/);
+  if (courseDeleteMatch && request.method === "DELETE") {
+    if (activeTask) {
+      sendJson(response, 409, { error: "Another course action is already running." });
+      return;
+    }
+    const courseId = assertCourseId(courseDeleteMatch[1]);
+    const reservation = { child: null, action: "delete-course", courseId };
+    activeTask = reservation;
+    try {
+      await annotationMutation;
+      try {
+        await verifiedCourseRoot(courseId);
+      } catch (error) {
+        // An unreadable course cannot pass full verification, yet deleting it
+        // is exactly how the learner recovers. Diagnosed courses stay deletable.
+        if (error.message !== "Unknown teaching workspace") throw error;
+        const { diagnostics } = await discoverCoursesDetailed(WORKSPACE_ROOT);
+        if (!diagnostics.some((item) => item.id === courseId)) throw error;
+      }
+      const result = await moveCourseToTrash(WORKSPACE_ROOT, courseId);
+      sendJson(response, 200, { ok: true, ...result });
+    } finally {
+      if (activeTask === reservation) activeTask = null;
+    }
     return;
   }
 
@@ -1615,12 +1955,17 @@ async function handleRequest(request, response, {
   }
 
   if (annotationListMatch && request.method === "POST") {
-    const courseRoot = await verifiedCourseRoot(annotationListMatch[1]);
+    const courseId = assertCourseId(annotationListMatch[1]);
+    if (annotationsLockedByActiveTask(courseId)) {
+      sendJson(response, 409, { error: "This course is busy with the current teacher action. Your note can be saved when it finishes." });
+      return;
+    }
+    const courseRoot = await verifiedCourseRoot(courseId);
     const body = await readJson(request, ANNOTATION_BODY_LIMIT);
     const lesson = assertLessonPath(body.lesson);
     const lessonFile = await confinedRealPath(courseRoot, path.join(courseRoot, lesson)).catch(() => "");
     if (!lessonFile || !(await fileExists(lessonFile))) throw new Error("The selected lesson no longer exists");
-    const annotation = await mutateAnnotations(() => addAnnotation(WORKSPACE_ROOT, annotationListMatch[1], body));
+    const annotation = await guardedAnnotationMutation(courseId, () => addAnnotation(WORKSPACE_ROOT, courseId, body));
     sendJson(response, 201, { annotation });
     return;
   }
@@ -1641,8 +1986,13 @@ async function handleRequest(request, response, {
 
   const annotationItemMatch = pathname.match(/^\/api\/courses\/([^/]+)\/annotations\/([^/]+)$/);
   if (annotationItemMatch && request.method === "DELETE") {
-    await verifiedCourseRoot(annotationItemMatch[1]);
-    const removed = await mutateAnnotations(() => deleteAnnotation(WORKSPACE_ROOT, annotationItemMatch[1], annotationItemMatch[2]));
+    const courseId = assertCourseId(annotationItemMatch[1]);
+    if (annotationsLockedByActiveTask(courseId)) {
+      sendJson(response, 409, { error: "This course is busy with the current teacher action. The note can be deleted when it finishes." });
+      return;
+    }
+    await verifiedCourseRoot(courseId);
+    const removed = await guardedAnnotationMutation(courseId, () => deleteAnnotation(WORKSPACE_ROOT, courseId, annotationItemMatch[2]));
     sendJson(response, removed ? 200 : 404, removed ? { ok: true } : { error: "Message not found" });
     return;
   }
@@ -1654,7 +2004,7 @@ async function handleRequest(request, response, {
 
   if (request.method === "GET") {
     const relative = pathname === "/" ? "index.html" : pathname.replace(/^\//, "");
-    await serveFile(response, publicPath(relative), { cache: relative !== "index.html" });
+    await serveFile(response, publicPath(relative));
     return;
   }
 
@@ -1692,13 +2042,26 @@ export function createAppServer({
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const libraryLock = await acquireLibraryLock(WORKSPACE_ROOT).catch((error) => {
     console.error(`Margin could not lock the learning library: ${error.message}`);
-    process.exit(1);
+    process.exit(startupExitStatus(error));
   });
   await recoverCourseTransactions(WORKSPACE_ROOT).catch(async (error) => {
     await libraryLock.release().catch(() => {});
     console.error(`Margin could not recover an unfinished course action: ${error.message}`);
     process.exit(1);
   });
+  await clearActiveTeacherMarker().catch((error) => {
+    console.error(`Margin could not clear stale teacher state: ${error.message}`);
+  });
+  const courseCreationRecovery = await recoverCourseCreationArtifacts(WORKSPACE_ROOT).catch(async (error) => {
+    await libraryLock.release().catch(() => {});
+    console.error(`Margin could not recover unfinished course creation: ${error.message}`);
+    process.exit(1);
+  });
+  if (courseCreationRecovery.recoveredCourses.length || courseCreationRecovery.archivedDrafts.length) {
+    console.error(
+      `Margin recovered ${courseCreationRecovery.recoveredCourses.length} completed course draft(s) and archived ${courseCreationRecovery.archivedDrafts.length} unfinished draft(s).`,
+    );
+  }
   const sessionToken = launchToken();
   const contentServer = createContentServer();
   contentServer.listen(CONTENT_PORT, HOST, () => {
@@ -1735,7 +2098,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
           // End the UI stream and let the installer finish independently.
           task.endResponse?.();
           task.child?.unref?.();
-          task.release?.();
+          await task.release?.();
         } else if (task?.cancel) {
           task.cancel("Margin is shutting down.");
           await task.settled;

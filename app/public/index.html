@@ -79,6 +79,25 @@
     </form>
   </dialog>
 
+  <dialog class="delete-dialog" id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-detail">
+    <form class="delete-form" id="delete-form">
+      <div class="delete-heading">
+        <span class="delete-mark" aria-hidden="true">×</span>
+        <div>
+          <p class="delete-kicker">Move to Margin Trash</p>
+          <h2 id="delete-title">Delete course?</h2>
+        </div>
+      </div>
+      <p id="delete-detail" class="delete-detail"></p>
+      <p id="delete-recovery" class="delete-recovery"></p>
+      <p id="delete-error" class="delete-error" role="alert" hidden></p>
+      <div class="delete-actions">
+        <button id="cancel-delete" class="secondary-button" type="button">Cancel</button>
+        <button id="confirm-delete" class="danger-button" type="submit">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
   <div class="app-shell" id="app" data-ready="false" data-left-collapsed="false" data-right-collapsed="false" hidden>
     <aside class="course-rail" id="course-rail" aria-label="Course navigation">
       <div class="panel-scale-content" id="course-panel-content">

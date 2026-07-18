@@ -19,6 +19,7 @@ import test from "node:test";
 import {
   beginCourseTransaction,
   commitCourseTransaction,
+  courseTransactionMatchesSnapshot,
   courseTransactionPaths,
   recoverCourseTransactions,
   rollbackCourseTransaction,
@@ -88,6 +89,7 @@ test("rollback restores every course artifact and preserves internal symbolic li
     fixture.courseId,
     fixture.courseRoot,
   );
+  assert.equal(await courseTransactionMatchesSnapshot(transaction), true);
   assert.equal(
     await readFile(path.join(transaction.transactionRoot, courseTransactionPaths.snapshot, "vocabulary.json"), "utf8"),
     "{\"term\":\"original\"}\n",
@@ -102,6 +104,7 @@ test("rollback restores every course artifact and preserves internal symbolic li
   await writeFile(path.join(fixture.courseRoot, "notes", "partial.md"), "partial\n", "utf8");
   await rm(path.join(fixture.courseRoot, "references", "latest-diagram"));
   await symlink(outside, path.join(fixture.courseRoot, "references", "latest-diagram"));
+  assert.equal(await courseTransactionMatchesSnapshot(transaction), false);
 
   assert.deepEqual(await rollbackCourseTransaction(transaction), { restored: true, cleanupPending: false });
   assert.deepEqual(await treeManifest(fixture.courseRoot), before);
@@ -122,6 +125,64 @@ test("startup recovery rolls back a pending transaction", async (t) => {
   assert.deepEqual(recovery, { restored: [fixture.courseId], cleaned: [] });
   assert.deepEqual(await treeManifest(fixture.courseRoot), before);
   assert.deepEqual(await transactionEntries(fixture.workspaceRoot), []);
+});
+
+test("guard rollback restores the snapshot and archives the displaced course copy", async (t) => {
+  const fixture = await createFixture(t);
+  const transaction = await beginCourseTransaction(
+    fixture.workspaceRoot,
+    fixture.courseId,
+    fixture.courseRoot,
+    { preserveDisplaced: true },
+  );
+  await writeFile(path.join(fixture.courseRoot, "vocabulary.json"), "{\"term\":\"edited outside Margin\"}\n", "utf8");
+
+  const rollback = await rollbackCourseTransaction(transaction);
+  assert.equal(rollback.restored, true);
+  assert.match(rollback.archived, /^\.margin-trash\/guard-conflicts\/test-course--/);
+  assert.equal(
+    await readFile(path.join(fixture.workspaceRoot, rollback.archived, "vocabulary.json"), "utf8"),
+    "{\"term\":\"edited outside Margin\"}\n",
+  );
+  assert.equal(
+    await readFile(path.join(fixture.courseRoot, "vocabulary.json"), "utf8"),
+    "{\"term\":\"original\"}\n",
+  );
+  assert.deepEqual(await transactionEntries(fixture.workspaceRoot), []);
+});
+
+test("startup recovery preserves changes displaced by an interrupted guard", async (t) => {
+  const fixture = await createFixture(t);
+  await beginCourseTransaction(
+    fixture.workspaceRoot,
+    fixture.courseId,
+    fixture.courseRoot,
+    { preserveDisplaced: true },
+  );
+  await writeFile(path.join(fixture.courseRoot, "tool.mjs"), "export const value = 'external edit';\n", "utf8");
+
+  const recovery = await recoverCourseTransactions(fixture.workspaceRoot);
+  assert.deepEqual(recovery.restored, [fixture.courseId]);
+  const conflicts = await readdir(path.join(fixture.workspaceRoot, ".margin-trash", "guard-conflicts"));
+  assert.equal(conflicts.length, 1);
+  assert.equal(
+    await readFile(path.join(fixture.workspaceRoot, ".margin-trash", "guard-conflicts", conflicts[0], "tool.mjs"), "utf8"),
+    "export const value = 'external edit';\n",
+  );
+  assert.equal(await readFile(path.join(fixture.courseRoot, "tool.mjs"), "utf8"), "export const value = 1;\n");
+});
+
+test("startup recovery simply cleans an unchanged interrupted guard", async (t) => {
+  const fixture = await createFixture(t);
+  const transaction = await beginCourseTransaction(
+    fixture.workspaceRoot,
+    fixture.courseId,
+    fixture.courseRoot,
+    { preserveDisplaced: true },
+  );
+  const recovery = await recoverCourseTransactions(fixture.workspaceRoot);
+  assert.deepEqual(recovery, { restored: [], cleaned: [transaction.id] });
+  await assert.rejects(lstat(path.join(fixture.workspaceRoot, ".margin-trash")), { code: "ENOENT" });
 });
 
 test("committed transactions retain changes and are cleaned during startup recovery", async (t) => {
