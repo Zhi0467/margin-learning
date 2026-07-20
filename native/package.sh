@@ -11,7 +11,9 @@ ARCHIVE_PATH="$DIST_DIR/$ARCHIVE_NAME"
 "$SCRIPT_DIR/build.sh"
 
 mkdir -p "$DIST_DIR"
-rm -f "$ARCHIVE_PATH" "$DIST_DIR/SHA256SUMS"
+# dist/ holds only the current version's artifacts; stale zips from earlier
+# versions must not linger where they could be tested or shipped by mistake.
+rm -f "$DIST_DIR"/Margin-*.zip(N) "$DIST_DIR/SHA256SUMS"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$ROOT_DIR/Margin.app" "$ARCHIVE_PATH"
 (cd "$DIST_DIR" && /usr/bin/shasum -a 256 "$ARCHIVE_NAME" > SHA256SUMS)
 
