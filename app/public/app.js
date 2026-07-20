@@ -73,7 +73,7 @@ const state = {
 };
 
 const elements = Object.fromEntries([
-  "app", "library-view", "course-shelf", "new-course-dialog", "new-course-form", "new-course-name",
+  "app", "library-view", "library-task-host", "course-shelf", "new-course-dialog", "new-course-form", "new-course-name",
   "new-course-request", "new-course-teacher-slip", "new-course-teacher-select", "new-course-model-select",
   "new-course-effort-select", "new-course-teacher-status", "new-course-config-hint", "new-course-progress",
   "new-course-progress-title", "new-course-progress-activity", "cancel-new-course", "create-new-course",
@@ -88,7 +88,7 @@ const elements = Object.fromEntries([
   "save-message", "unused-count", "lecture-history-button", "message-count", "message-list", "teacher-menu-button", "teacher-current-glyph",
   "teacher-current-name", "teacher-current-config", "provider-picker", "teacher-model-input",
   "teacher-effort-select", "teacher-config-hint",
-  "revise-button", "revise-detail", "next-button", "next-detail", "teacher-run", "run-title",
+  "revise-button", "revise-detail", "next-button", "next-detail", "teacher-run", "teacher-dock", "run-title",
   "run-activity", "open-run-details", "run-details-view", "close-run-details", "run-detail-title",
   "run-detail-activity", "run-log", "cancel-run", "history-view", "close-history", "history-title", "history-summary",
   "history-list", "history-preview-empty", "history-preview-frame", "toast",
@@ -273,12 +273,17 @@ function escapeHtml(value) {
 }
 
 let toastTimer;
-function showToast(message, { error = false } = {}) {
+function showToast(message, { error = false, taskComplete = false } = {}) {
   clearTimeout(toastTimer);
   elements.toast.textContent = message;
   elements.toast.classList.toggle("error", error);
+  elements.toast.classList.toggle("task-complete", taskComplete);
   elements.toast.hidden = false;
-  toastTimer = setTimeout(() => { elements.toast.hidden = true; }, error ? 6500 : 3200);
+  toastTimer = setTimeout(() => { elements.toast.hidden = true; }, error ? 6500 : taskComplete ? 5000 : 3200);
+}
+
+function showTaskCompletion(message) {
+  showToast(message, { taskComplete: true });
 }
 
 function panelIsCollapsed(side) {
@@ -823,7 +828,10 @@ async function performDeletion(event) {
 }
 
 function openNewCourseDialog() {
-  if (state.newCourseRun) return;
+  if (state.newCourseRun) {
+    openRunDetails();
+    return;
+  }
   elements.newCourseForm.reset();
   resetNewCourseProgress();
   renderProviders();
@@ -843,50 +851,50 @@ async function cancelNewCourseCreation() {
   const run = state.newCourseRun;
   if (!run || !["creating", "running"].includes(run.phase)) return;
   run.phase = "cancelling";
-  setNewCourseProgress("running", "Cancelling course creation", "Stopping the teacher and rolling back unfinished work…");
-  renderNewCourseFormState();
+  setRunState("running", "Stopping the teacher and rolling back unfinished work…");
   try {
     const result = await requestOperationCancellation(run);
     if (state.newCourseRun !== run) return;
     if (result.status === "finishing" || result.status === "complete") {
       run.phase = "committed";
-      setNewCourseProgress("running", "Finishing the lecture", "Final validation has begun; Margin will keep the result if it completes.");
-      renderNewCourseFormState();
+      setRunState("running", "Final validation has begun; Margin will keep the result if it completes.");
     }
   } catch (error) {
     if (state.newCourseRun === run) {
       run.cancelRequested = false;
       run.phase = "creating";
-      setNewCourseProgress("running", `${providerName(run.provider)} is preparing lecture 1`, "Teaching continues in the background.");
-      renderNewCourseFormState();
+      setRunState("running", "Teaching continues in the background.");
     }
     showToast(`Could not request cancellation: ${error.message}`, { error: true });
   }
 }
 
-async function openCompletedCourse(completedEvent, run) {
+async function applyCourseCreationCompletion(completedEvent, run) {
   const completedCourse = completedEvent.course;
   const courseId = typeof completedCourse === "string" ? completedCourse : completedCourse?.id;
   if (!courseId || !completedEvent.lesson) throw new Error("The teacher finished, but did not identify the new course and lecture");
 
-  if (state.newCourseRun === run) state.newCourseRun.phase = "opening";
-  setNewCourseProgress("done", "Lecture 1 is ready", "Opening the new course…");
-  renderNewCourseFormState();
+  const shouldOpen = state.view === "library" && state.navigationGeneration === run.navigationGeneration;
+  if (state.newCourseRun === run) state.newCourseRun.phase = "committed";
+  setRunState("done", "Course and first lecture created.");
   if (completedCourse && typeof completedCourse === "object") {
     state.courses = [...state.courses.filter((course) => course.id !== courseId), completedCourse];
     renderLibrary();
   } else {
     await refreshCourses();
   }
-  const opened = await openCourse(courseId, completedEvent.lesson);
-  if (!opened) throw new Error("Margin could not open the new lecture");
+  if (shouldOpen) {
+    if (state.newCourseRun === run) state.newCourseRun.phase = "opening";
+    const opened = await openCourse(courseId, completedEvent.lesson);
+    if (!opened) throw new Error("Margin could not open the new lecture");
+  }
   closeNewCourseDialog({ force: true });
-  showToast("Course and first lecture created.");
+  showTaskCompletion(shouldOpen ? "Course and first lecture created." : "Course and first lecture created in the background.");
 }
 
 async function createNewCourse(event) {
   event.preventDefault();
-  if (state.newCourseRun) return;
+  if (state.activeRun || state.newCourseRun) return;
   const title = elements.newCourseName.value.trim();
   const initialRequest = elements.newCourseRequest.value.trim();
   if (!title || !initialRequest) {
@@ -907,11 +915,25 @@ async function createNewCourse(event) {
   const provider = state.selectedTeacher;
   const { model, effort } = { ...teacherSettings(provider) };
   const controller = new AbortController();
-  const run = { controller, phase: "creating", provider, model, effort, operationId: "", cancelRequested: false };
+  const run = {
+    controller,
+    phase: "creating",
+    action: "create",
+    provider,
+    model,
+    effort,
+    operationId: "",
+    cancelRequested: false,
+    navigationGeneration: state.navigationGeneration,
+  };
   state.newCourseRun = run;
   const configuration = [model || "default model", effort ? `${effort} thinking` : "default thinking"].join(" · ");
-  setNewCourseProgress("running", `${providerName(provider)} is preparing lecture 1`, `Starting with ${configuration}…`);
+  resetRunLog();
+  elements.runTitle.textContent = `${providerName(provider)} · new course`;
+  setRunState("running", `Starting with ${configuration}…`);
   renderProviders();
+  closeNewCourseDialog({ force: true });
+  showToast("Starting course creation in the background.");
   let completedEvent = null;
   let committed = false;
   let operationId = "";
@@ -930,24 +952,30 @@ async function createNewCourse(event) {
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.error || `Course creation failed (${response.status})`);
     }
+    run.phase = "running";
     await readNdjson(response, (teacherEvent) => {
       if (teacherEvent.type === "error") throw new Error(teacherEvent.text || "The teacher could not create the first lecture");
       if (teacherEvent.type === "complete") {
         completedEvent = teacherEvent;
         committed = true;
+        run.phase = "committed";
+        if (teacherEvent.text && (state.lastRunLogKind !== "summary" || state.lastRunLogText !== teacherEvent.text)) {
+          appendRunLog(teacherEvent.text, "summary");
+        }
         return;
       }
       if (teacherEvent.type === "started") {
-        setNewCourseProgress("running", teacherEvent.text || `${providerName(provider)} is preparing lecture 1`, `Using ${configuration}…`);
+        setRunState("running", teacherEvent.text || `${providerName(provider)} is preparing lecture 1`);
         return;
       }
       if (["status", "activity", "summary", "message"].includes(teacherEvent.type) && teacherEvent.text) {
-        setNewCourseProgress("running", `${providerName(provider)} is preparing lecture 1`, teacherEvent.text);
+        elements.runDetailActivity.textContent = teacherEvent.text;
+        appendRunLog(teacherEvent.text, teacherEvent.type);
       }
     });
     if (!completedEvent) throw new Error("The teacher stopped without completing the first lecture");
     await clearOperation(operationId);
-    await openCompletedCourse(completedEvent, run);
+    await applyCourseCreationCompletion(completedEvent, run);
   } catch (error) {
     if (!committed && operationId) {
       const resolution = await reconcileOperation(operationId);
@@ -956,21 +984,17 @@ async function createNewCourse(event) {
         committed = true;
         await clearOperation(operationId);
         try {
-          await openCompletedCourse(completedEvent, run);
+          await applyCourseCreationCompletion(completedEvent, run);
           return;
         } catch (openError) {
           error = openError;
         }
       } else if (resolution.status === "running") {
-        setNewCourseProgress(
-          "running",
-          `${providerName(provider)} is still preparing lecture 1`,
-          "The activity stream changed, but teaching continues safely in the background.",
-        );
+        setRunState("running", "The activity stream changed, but teaching continues safely in the background.");
         const terminal = await waitForOperationTerminal(operationId, {
           onRunning: (_task, connectionError) => {
             if (connectionError) {
-              setNewCourseProgress("running", "Reconnecting to the teacher", "The background task is safe; Margin is retrying its status connection.");
+              setRunState("running", "Reconnecting to the background teacher…");
             }
           },
         });
@@ -979,7 +1003,7 @@ async function createNewCourse(event) {
           committed = true;
           await clearOperation(operationId);
           try {
-            await openCompletedCourse(completedEvent, run);
+            await applyCourseCreationCompletion(completedEvent, run);
             return;
           } catch (openError) {
             error = openError;
@@ -988,38 +1012,41 @@ async function createNewCourse(event) {
           await clearOperation(operationId);
         } else {
           const detail = terminal.error ? ` ${terminal.error.message}` : "";
-          setNewCourseProgress("error", "Course result is not confirmed", `Margin could not confirm whether lecture 1 was saved.${detail}`);
+          const message = `Margin could not confirm whether lecture 1 was saved.${detail}`;
+          appendRunLog(message, "error");
+          setRunState("error", message);
+          showToast(message, { error: true });
           return;
         }
       } else if (resolution.status === "unknown") {
         await clearOperation(operationId);
       } else {
         const detail = resolution.error ? ` ${resolution.error.message}` : "";
-        setNewCourseProgress(
-          "error",
-          "Course result is not confirmed",
-          `Margin could not confirm whether lecture 1 was saved.${detail} Reopen the library before trying again; the same form will reuse this operation safely.`,
-        );
+        const message = `Margin could not confirm whether lecture 1 was saved.${detail} Reopen the library before trying again; the same form will reuse this operation safely.`;
+        appendRunLog(message, "error");
+        setRunState("error", message);
+        showToast(message, { error: true });
         return;
       }
     }
     if (committed) {
-      setNewCourseProgress("done", "Course and lecture 1 were saved", "Margin could not open or refresh the saved course.");
+      const message = `Course was saved, but Margin could not open or refresh it: ${error.message}. Do not create it again; open it from the library or restart Margin.`;
+      appendRunLog(message, "error");
+      setRunState("done", message);
       closeNewCourseDialog({ force: true });
-      showToast(`Course was saved, but Margin could not open or refresh it: ${error.message}. Do not create it again; open it from the library or restart Margin.`, { error: true });
+      showToast(message, { error: true });
       return;
     }
     if (!controller.signal.aborted) controller.abort();
     const cancelled = run.cancelRequested || error.name === "AbortError";
-    setNewCourseProgress(
-      cancelled ? "cancelled" : "error",
-      cancelled ? "Course creation cancelled" : "The first lecture was not created",
-      cancelled
-        ? "Adjust the title or teaching request, then try again when you are ready."
-        : `${error.message}. Check the teacher setup or revise the request, then try again.`,
-    );
+    const message = cancelled ? "Course creation cancelled." : error.message;
+    appendRunLog(message, cancelled ? "status" : "error");
+    setRunState("error", message);
+    showToast(message, { error: !cancelled });
   } finally {
     if (state.newCourseRun?.controller === controller) state.newCourseRun = null;
+    elements.cancelRun.disabled = false;
+    if (elements.teacherRun.dataset.state !== "running") elements.cancelRun.textContent = "Dismiss";
     renderProviders();
     schedulePendingOperationReconciliation();
   }
@@ -1028,6 +1055,7 @@ async function createNewCourse(event) {
 function showLibrary() {
   state.navigationGeneration += 1;
   state.view = "library";
+  placeTeacherRun();
   updatePanelResizerAccessibility();
   closeTeacherMenu();
   hideSelectionPopover();
@@ -1040,6 +1068,7 @@ async function openCourse(courseId, preferredDocument = null) {
   const navigationGeneration = ++state.navigationGeneration;
   try {
     state.view = "reader";
+    placeTeacherRun();
     elements.libraryView.hidden = true;
     elements.app.hidden = false;
     normalizePanelWidths();
@@ -1230,7 +1259,7 @@ function renderProviders() {
   elements.teacherCurrentName.textContent = selectedName;
   elements.teacherCurrentConfig.textContent = selectedProvider ? teacherConfigSummary(selectedProvider) : "No CLI available";
   renderProviderGlyph(elements.teacherCurrentGlyph, selectedProvider);
-  const busy = Boolean(state.activeRun);
+  const busy = Boolean(state.activeRun || state.newCourseRun);
   const updating = state.activeRun?.action === "update";
   elements.teacherMenuButton.disabled = !state.providers.length;
   elements.teacherMenuButton.title = selectedProvider?.error || providerStatus(selectedProvider);
@@ -1762,16 +1791,36 @@ function closeTeacherMenu({ restoreFocus = false } = {}) {
   if (restoreFocus) elements.teacherMenuButton.focus({ preventScroll: true });
 }
 
+function backgroundRun() {
+  return state.activeRun || state.newCourseRun;
+}
+
+function placeTeacherRun() {
+  if (state.view === "library") {
+    if (elements.teacherRun.parentElement !== elements.libraryTaskHost) {
+      elements.libraryTaskHost.append(elements.teacherRun);
+    }
+    elements.libraryTaskHost.hidden = elements.teacherRun.hidden;
+    return;
+  }
+  if (elements.teacherRun.nextElementSibling !== elements.teacherDock) {
+    elements.teacherDock.before(elements.teacherRun);
+  }
+  elements.libraryTaskHost.hidden = true;
+}
+
 function setRunState(kind, text) {
-  const cancelling = state.activeRun?.phase === "cancelling";
-  const finishing = state.activeRun?.phase === "committed";
-  const updateInProgress = kind === "running" && state.activeRun?.action === "update";
+  const run = backgroundRun();
+  const cancelling = run?.phase === "cancelling";
+  const finishing = run?.phase === "committed" || run?.phase === "opening";
+  const updateInProgress = kind === "running" && run?.action === "update";
   elements.teacherRun.hidden = false;
+  placeTeacherRun();
   elements.teacherRun.dataset.state = kind;
   elements.runDetailsView.dataset.state = kind;
   elements.cancelRun.hidden = updateInProgress;
   elements.cancelRun.disabled = cancelling || finishing;
-  elements.cancelRun.textContent = cancelling ? "Cancelling…" : finishing ? "Finishing…" : kind === "running" || state.activeRun ? "Cancel" : "Dismiss";
+  elements.cancelRun.textContent = cancelling ? "Cancelling…" : finishing ? "Finishing…" : kind === "running" || run ? "Cancel" : "Dismiss";
   elements.runActivity.textContent = updateInProgress
     ? "Update in progress."
     : cancelling
@@ -1896,14 +1945,14 @@ async function applyTeacherCompletion({ action, courseId, lesson }, completedEve
   if (state.view === "reader" && state.course) await loadAnnotations();
   if (stayedWithTask && state.course?.id === courseId && !preserveMarginDraft) {
     await loadDocument(completedEvent.lesson);
-    showToast(action === "revise" ? "Lecture revised." : "Next lecture created.");
+    showTaskCompletion(action === "revise" ? "Lecture revised." : "Next lecture created.");
   } else if (state.view === "reader" && state.course) {
     renderCourseRail();
     updateReaderMetadata();
     renderMessages();
-    showToast(preserveMarginDraft ? "Teacher finished. Your open margin draft was kept." : "Teacher finished in the background.");
+    showTaskCompletion(preserveMarginDraft ? "Teacher finished. Your open margin draft was kept." : "Teacher finished in the background.");
   } else {
-    showToast("Teacher finished in the background.");
+    showTaskCompletion("Teacher finished in the background.");
   }
 }
 
@@ -1917,7 +1966,7 @@ function selectedTeacherAnnotationIds(action, chapter, lesson) {
 }
 
 async function runTeacher(action) {
-  if (state.activeRun || !currentLesson()) return;
+  if (state.activeRun || state.newCourseRun || !currentLesson()) return;
   const checkedProvider = state.providers.find((item) => item.id === state.selectedTeacher);
   if (!providerReady(checkedProvider)) {
     showToast(checkedProvider?.error || "The selected teacher is not ready.", { error: true });
@@ -2087,7 +2136,7 @@ async function runTeacher(action) {
 }
 
 async function runProviderUpdate(provider) {
-  if (state.activeRun) return;
+  if (state.activeRun || state.newCourseRun) return;
   const installed = state.providers.find((item) => item.id === provider);
   if (!installed?.available) {
     showToast(`${providerName(provider)} is not installed.`, { error: true });
@@ -2133,7 +2182,7 @@ async function runProviderUpdate(provider) {
     });
     if (!completedEvent) throw new Error("The update stopped without completing");
     await refreshProviders();
-    showToast(completedEvent.text || `${providerName(provider)} update complete.`);
+    showTaskCompletion(completedEvent.text || `${providerName(provider)} update complete.`);
   } catch (error) {
     if (!controller.signal.aborted) controller.abort();
     const message = error.name === "AbortError" ? "Update cancelled." : error.message;
@@ -2150,6 +2199,10 @@ async function runProviderUpdate(provider) {
 }
 
 async function cancelRun() {
+  if (state.newCourseRun) {
+    await cancelNewCourseCreation();
+    return;
+  }
   if (state.activeRun?.action === "update") return;
   if (state.activeRun?.phase === "running") {
     const run = state.activeRun;
@@ -2174,6 +2227,7 @@ async function cancelRun() {
   else if (!state.activeRun) {
     closeRunDetails();
     elements.teacherRun.hidden = true;
+    placeTeacherRun();
   }
 }
 
@@ -2261,51 +2315,59 @@ async function resumePendingCourseCreation(entry, task = {}) {
   const run = {
     controller,
     phase: "running",
+    action: "create",
     provider,
     operationId: entry.id,
     cancelRequested: false,
     resumed: true,
+    navigationGeneration: state.navigationGeneration,
   };
   state.newCourseRun = run;
-  elements.newCourseForm.reset();
-  resetNewCourseProgress();
+  resetRunLog();
+  elements.runTitle.textContent = `${providerName(provider)} · new course`;
+  setRunState("running", task.notice || "Reconnected to course creation already running in the background.");
+  if (task.notice) appendRunLog(task.notice, "status");
   renderProviders();
-  setNewCourseProgress(
-    "running",
-    `${providerName(provider)} is preparing lecture 1`,
-    task.notice || "Reconnected to course creation already running in the background.",
-  );
-  if (!elements.newCourseDialog.open) elements.newCourseDialog.showModal();
 
   try {
     const result = await waitForOperationTerminal(entry.id, {
       onRunning: (activeTask, connectionError) => {
         if (connectionError) {
-          setNewCourseProgress("running", "Reconnecting to the teacher", "The background task is safe; Margin is retrying its status connection.");
+          setRunState("running", "Reconnecting to the background teacher…");
         } else if (activeTask?.notice) {
-          setNewCourseProgress("running", `${providerName(provider)} is preparing lecture 1`, activeTask.notice);
+          setRunState("running", activeTask.notice);
+          appendRunLog(activeTask.notice, "status");
         }
       },
     });
     if (result.status === "complete") {
       run.phase = "committed";
       await clearOperation(entry.id);
-      await openCompletedCourse(result.event, run);
+      await applyCourseCreationCompletion(result.event, run);
       return;
     }
     if (result.status === "unknown") {
       await clearOperation(entry.id);
-      setNewCourseProgress(
-        run.cancelRequested ? "cancelled" : "error",
-        run.cancelRequested ? "Course creation cancelled" : "The first lecture was not created",
-        run.cancelRequested ? "The unfinished course was rolled back." : "The background teacher stopped without saving a lecture.",
-      );
+      const message = run.cancelRequested
+        ? "Course creation cancelled; the unfinished course was rolled back."
+        : "The background teacher stopped without saving a lecture.";
+      appendRunLog(message, run.cancelRequested ? "status" : "error");
+      setRunState("error", message);
+      return;
     }
+    const detail = result.error ? ` ${result.error.message}` : "";
+    const message = `Margin could not confirm whether lecture 1 was saved.${detail}`;
+    appendRunLog(message, "error");
+    setRunState("error", message);
+    showToast(message, { error: true });
   } catch (error) {
-    setNewCourseProgress("error", "Course result could not be opened", error.message);
+    appendRunLog(error.message, "error");
+    setRunState("error", error.message);
     showToast(error.message, { error: true });
   } finally {
     if (state.newCourseRun === run) state.newCourseRun = null;
+    elements.cancelRun.disabled = false;
+    if (elements.teacherRun.dataset.state !== "running") elements.cancelRun.textContent = "Dismiss";
     renderProviders();
     schedulePendingOperationReconciliation();
   }
@@ -2347,7 +2409,7 @@ async function reconcilePendingOperationsAtStartup() {
   }
   if (completed) {
     await refreshCourses();
-    showToast(`${completed} completed background teacher ${completed === 1 ? "result was" : "results were"} recovered.`);
+    showTaskCompletion(`${completed} completed background teacher ${completed === 1 ? "result was" : "results were"} recovered.`);
   }
   if (running.length) {
     const [{ entry, task }] = running;

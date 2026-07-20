@@ -81,6 +81,17 @@ button:disabled { cursor: not-allowed; }
 
 .library-brand h1 { font-size: 22px; }
 
+.library-task-host {
+  width: min(360px, 54%);
+  margin-left: auto;
+}
+
+.library-task-host .teacher-run {
+  width: 100%;
+  max-height: none;
+  margin: 0;
+}
+
 .brand-mark {
   display: grid;
   width: 38px;
@@ -1617,8 +1628,8 @@ body.history-open { overflow: hidden; }
 .toast {
   position: fixed;
   z-index: 100;
-  right: 374px;
-  bottom: 20px;
+  top: 20px;
+  right: 20px;
   max-width: 410px;
   padding: 10px 13px;
   border-radius: 7px;
@@ -1627,20 +1638,21 @@ body.history-open { overflow: hidden; }
   box-shadow: var(--shadow);
   font-size: 11px;
 }
+.toast.task-complete { background: var(--teal); }
 .toast.error { background: var(--oxblood); }
-.app-shell[data-right-collapsed="true"] ~ .toast { right: 20px; }
 
 @media (max-width: 1120px) {
   .app-shell { --course-base-width: 194px; --margin-base-width: 320px; }
   .app-shell[data-left-collapsed="true"] { --course-width: 0px; }
   .app-shell[data-right-collapsed="true"] { --margin-width: 0px; }
   .course-rail { padding-inline: 11px; }
-  .toast { right: 338px; }
 }
 
 @media (max-width: 900px) {
   body { overflow: auto; }
   .library-brand, .library-main { width: min(100% - 36px, 720px); }
+  .library-brand { flex-wrap: wrap; }
+  .library-task-host { width: 100%; margin-top: 10px; }
   .library-main { padding-top: 42px; }
   .course-shelf { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
   .app-shell { display: grid; grid-template-areas: "course" "reader" "margin"; grid-template-columns: 1fr; height: auto; min-height: 100vh; }
@@ -1649,7 +1661,7 @@ body.history-open { overflow: hidden; }
   .chapter-list { overflow: visible; }
   .reader-panel { min-height: 72vh; }
   .margin-panel { min-height: 580px; border-top: 1px solid var(--rule); border-left: 0; }
-  .toast { right: 18px; }
+  .toast { top: 18px; right: 18px; }
   .run-details-header { grid-template-columns: 1fr; gap: 12px; }
   .run-details-main { padding-left: 0; }
   .history-view { overflow: auto; }
