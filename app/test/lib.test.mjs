@@ -1241,6 +1241,33 @@ test("an operation receipt whose course disappeared resolves to unknown instead 
   assert.equal(JSON.parse(response.body.toString("utf8")).status, "unknown");
 });
 
+test("operation recovery ignores non-course directories in the learning library", async (t) => {
+  const { root, course } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "Margin Dev.app"), { recursive: true });
+  await recordLectureVersion(course, "lessons/0001-start.html", {
+    action: "create",
+    provider: "codex",
+    operationId: "course-create-bundle-1",
+    operationAction: "course-create",
+    requestHash: "a".repeat(64),
+  });
+
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?bundle-operation-recovery=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const response = await requestApp(createAppServer(), {
+    pathname: "/api/operations/course-create-bundle-1",
+  });
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body.toString("utf8"));
+  assert.equal(payload.status, "complete");
+  assert.equal(payload.event.course.id, "systems");
+});
+
 test("an unrelated unguardable course is reported without blocking teaching", async (t) => {
   const { root, course } = await fixture();
   t.after(() => rm(root, { recursive: true, force: true }));

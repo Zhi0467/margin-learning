@@ -1112,6 +1112,13 @@ async function findWorkspaceOperation(id) {
   let found = null;
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    try {
+      assertCourseId(entry.name);
+    } catch {
+      // The learning library may also contain the local app bundle or other
+      // user files. They are not course candidates for operation recovery.
+      continue;
+    }
     let courseRoot;
     try {
       courseRoot = await verifiedCourseRoot(entry.name);
