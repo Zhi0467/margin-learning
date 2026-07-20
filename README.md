@@ -9,6 +9,13 @@ Learning and teaching are asynchronous. Reading never starts a background
 agent, and leaving a note never claims that something was learned. A teacher
 runs only when you click a teaching action.
 
+![A lecture in the Margin reader, with margin notes on the right and explicit teacher actions below them](docs/screenshots/reader.png)
+
+<p>
+  <img src="docs/screenshots/library.png" width="49.5%" alt="The course library shelf" />
+  <img src="docs/screenshots/new-course.png" width="49.5%" alt="Creating a course: title, teaching brief, and teacher selection" />
+</p>
+
 > **Developer beta:** Margin 0.1.1 is an unsigned, Apple Silicon-only build for
 > macOS 13 or newer. Expect rough edges and read the permissions section before
 > using a teacher.
