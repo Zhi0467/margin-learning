@@ -468,9 +468,19 @@ test("failed first-lecture generation never reveals a course", async (t) => {
   const events = response.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(events.at(-1).type, "error");
   assert.match(events.at(-1).text, /exited with code 1/);
+  assert.equal(events.at(-1).interruption.kind, "crashed");
+  assert.equal(events.at(-1).interruption.hasPartialWork, true);
+  assert.ok(events.at(-1).interruption.handoffId);
   assert.match(fake.calls[0].prompt, /Legacy goal alias/);
   assert.deepEqual(await discoverCourses(root), []);
-  assert.deepEqual((await readdir(root)).filter((name) => name !== ".margin-state"), []);
+  const handoffId = events.at(-1).interruption.handoffId;
+  assert.equal(
+    (await lstat(path.join(root, ".margin-teacher-handoffs", handoffId, "partial-course"))).isDirectory(),
+    true,
+  );
+  const handoffResponse = await requestApp(server, { pathname: `/api/teacher-handoffs/${handoffId}` });
+  assert.equal(handoffResponse.status, 200);
+  assert.equal(JSON.parse(handoffResponse.body.toString("utf8")).handoff.title, "Invisible failure");
 });
 
 test("a spawn failure is reported even when the teacher stdin also closes early", async (t) => {
@@ -597,6 +607,221 @@ test("an explicit cancel stops a hung teacher with TERM then KILL before releasi
   });
   const retryEvents = retry.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(retryEvents.at(-1).type, "complete");
+});
+
+test("pausing a background course checkpoints partial files and releases the task slot", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "margin-course-pause-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?course-pause=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const sessionId = "12345678-1234-4123-8123-123456789abc";
+  const signals = [];
+  const spawnProcess = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGTERM" && child.exitCode == null) {
+        child.exitCode = 143;
+        child.stdout.end();
+        child.stderr.end();
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    let prompt = "";
+    child.stdin = new Writable({
+      write(chunk, _encoding, callback) {
+        prompt += chunk.toString("utf8");
+        callback();
+      },
+      final(callback) {
+        Promise.resolve().then(async () => {
+          const courseRoot = prompt.match(/^The one selected course for this action is: (.+)$/m)?.[1]?.trim();
+          await writeFile(
+            path.join(courseRoot, "lessons", "0001-partial.html"),
+            "<!doctype html><html><head><title>Partial</title></head><body><h1>Partial draft</h1></body></html>",
+          );
+          child.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n`);
+          callback();
+        }).catch(callback);
+      },
+    });
+    return child;
+  };
+  const server = createAppServer({ providerLookup: async () => READY_CODEX, spawnProcess });
+  const operationId = "pause-course-test-1";
+  await disconnectStreamingRequest(server, {
+    pathname: "/api/courses/create",
+    disconnectOn: "status",
+    body: JSON.stringify({
+      title: "Paused course",
+      initialRequest: "Teach checkpointing.",
+      provider: "codex",
+      operationId,
+    }),
+  });
+  const pause = await requestApp(server, {
+    method: "POST",
+    pathname: `/api/operations/${operationId}/cancel`,
+    body: JSON.stringify({ mode: "pause" }),
+  });
+  assert.equal(pause.status, 202);
+  assert.equal(JSON.parse(pause.body.toString("utf8")).status, "pausing");
+
+  let status;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const response = await requestApp(server, { pathname: `/api/operations/${operationId}` });
+    status = JSON.parse(response.body.toString("utf8"));
+    if (status.status === "failed") break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(status.status, "failed");
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.equal(status.failure.kind, "paused");
+  assert.equal(status.failure.sessionId, sessionId);
+  assert.equal(status.failure.hasPartialWork, true);
+  assert.deepEqual(await discoverCourses(root), []);
+  assert.equal(
+    (await lstat(path.join(root, ".margin-teacher-handoffs", operationId, "partial-course", "lessons", "0001-partial.html"))).isFile(),
+    true,
+  );
+
+  const abandoned = await requestApp(server, {
+    method: "DELETE",
+    pathname: `/api/teacher-handoffs/${operationId}`,
+  });
+  assert.equal(abandoned.status, 200);
+  await assert.rejects(lstat(path.join(root, ".margin-teacher-handoffs", operationId)), { code: "ENOENT" });
+});
+
+test("pausing during provider preflight creates a resumable metadata checkpoint", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "margin-course-preflight-pause-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?course-preflight-pause=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  let releaseLookup;
+  let announceLookup;
+  const lookupStarted = new Promise((resolve) => { announceLookup = resolve; });
+  const lookupReleased = new Promise((resolve) => { releaseLookup = resolve; });
+  let launches = 0;
+  const operationId = "preflight-pause-test-1";
+  const server = createAppServer({
+    providerLookup: async () => {
+      announceLookup();
+      await lookupReleased;
+      return READY_CODEX;
+    },
+    spawnProcess: () => {
+      launches += 1;
+      throw new Error("The paused teacher must not launch");
+    },
+  });
+  const creation = requestApp(server, {
+    method: "POST",
+    pathname: "/api/courses/create",
+    body: JSON.stringify({
+      title: "Preflight pause",
+      initialRequest: "Teach resumable preflight.",
+      provider: "codex",
+      operationId,
+    }),
+  });
+  await lookupStarted;
+  const pause = await requestApp(server, {
+    method: "POST",
+    pathname: `/api/operations/${operationId}/cancel`,
+    body: JSON.stringify({ mode: "pause" }),
+  });
+  assert.equal(JSON.parse(pause.body.toString("utf8")).status, "pausing");
+  releaseLookup();
+  await creation;
+
+  const statusResponse = await requestApp(server, { pathname: `/api/operations/${operationId}` });
+  const status = JSON.parse(statusResponse.body.toString("utf8"));
+  assert.equal(status.status, "failed");
+  assert.equal(status.failure.kind, "paused");
+  assert.equal(status.failure.hasPartialWork, false);
+  assert.equal(status.failure.sessionId, "");
+  assert.equal(launches, 0);
+});
+
+test("an inactive CLI is stopped by the watchdog and reported as stalled", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "margin-course-stall-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?course-stall=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const signals = [];
+  const spawnProcess = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGTERM" && child.exitCode == null) {
+        child.exitCode = 143;
+        child.stdout.end();
+        child.stderr.end();
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    let prompt = "";
+    child.stdin = new Writable({
+      write(chunk, _encoding, callback) {
+        prompt += chunk.toString("utf8");
+        callback();
+      },
+      final(callback) {
+        Promise.resolve().then(async () => {
+          const courseRoot = prompt.match(/^The one selected course for this action is: (.+)$/m)?.[1]?.trim();
+          await writeFile(path.join(courseRoot, "lessons", "0001-stalled.html"), "<h1>Unfinished</h1>");
+          callback();
+        }).catch(callback);
+      },
+    });
+    return child;
+  };
+  const operationId = "stalled-course-test-1";
+  const server = createAppServer({
+    providerLookup: async () => READY_CODEX,
+    spawnProcess,
+    teacherStallMilliseconds: 25,
+  });
+  const response = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/courses/create",
+    body: JSON.stringify({
+      title: "Stalled course",
+      initialRequest: "Teach watchdog behavior.",
+      provider: "codex",
+      operationId,
+    }),
+  });
+  const events = response.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "error");
+  assert.equal(events.at(-1).interruption.kind, "stalled");
+  assert.match(events.at(-1).text, /stopped producing activity/);
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.equal(
+    (await lstat(path.join(root, ".margin-teacher-handoffs", operationId, "partial-course", "lessons", "0001-stalled.html"))).isFile(),
+    true,
+  );
 });
 
 test("a response close during provider finalization does not discard a completed course", async (t) => {
@@ -1082,6 +1307,136 @@ test("teacher rollback restores the complete course after malformed lesson and s
   assert.deepEqual((await readAnnotationStore(root, "systems")).annotations.map((item) => item.id), [annotation.id]);
   const restoredHistory = JSON.parse(await readFile(path.join(course, ".learn", "lecture-history.json"), "utf8"));
   assert.ok(restoredHistory.lectures["lessons/0001-start.html"]);
+});
+
+test("a switched teacher receives the prior teacher's partial filesystem work", async (t) => {
+  const { root, course } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const lesson = "lessons/0001-start.html";
+  const originalLesson = await readFile(path.join(course, lesson), "utf8");
+  const annotation = await addAnnotation(root, "systems", {
+    lesson,
+    quote: "The first lecture",
+    message: "Add a concrete transfer example.",
+    anchor: null,
+  });
+  const previousRoot = process.env.MARGIN_WORKSPACE_ROOT;
+  process.env.MARGIN_WORKSPACE_ROOT = root;
+  const { createAppServer } = await import(`../server.mjs?teacher-switch=${Date.now()}`);
+  if (previousRoot === undefined) delete process.env.MARGIN_WORKSPACE_ROOT;
+  else process.env.MARGIN_WORKSPACE_ROOT = previousRoot;
+
+  const firstSessionId = "12345678-1234-4123-8123-123456789abc";
+  const secondSessionId = "87654321-4321-4321-8321-cba987654321";
+  const calls = [];
+  let transferredPartial = "";
+  const spawnProcess = (command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.kill = () => true;
+    let prompt = "";
+    child.stdin = new Writable({
+      write(chunk, _encoding, callback) {
+        prompt += chunk.toString("utf8");
+        callback();
+      },
+      final(callback) {
+        Promise.resolve().then(async () => {
+          const courseRoot = prompt.match(/^The one selected course for this action is: (.+)$/m)?.[1]?.trim();
+          calls.push({ command, args, prompt });
+          if (calls.length === 1) {
+            await writeFile(
+              path.join(courseRoot, lesson),
+              "<!doctype html><html><head><title>Partial revision</title></head><body><h1>Partial idea from Codex</h1></body></html>",
+            );
+            child.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: firstSessionId })}\n`);
+            child.stdout.write(`${JSON.stringify({ type: "error", message: "You have hit your usage limit; resets at 5pm" })}\n`);
+            child.exitCode = 1;
+            child.stdout.end();
+            child.stderr.end();
+            callback();
+            queueMicrotask(() => child.emit("close", 1, null));
+            return;
+          }
+
+          const partialRoot = prompt.match(/^Partial filesystem work from this and any earlier attempts is preserved at:\n- (.+)$/m)?.[1]?.trim();
+          transferredPartial = await readFile(path.join(partialRoot, lesson), "utf8");
+          if (!transferredPartial.includes("Partial idea from Codex")) throw new Error("The checkpoint did not contain the prior teacher's partial idea");
+          await writeFile(
+            path.join(courseRoot, lesson),
+            "<!doctype html><html><head><title>Start revised</title></head><body><h1 data-learn-block=\"start\">The first lecture</h1><p>This complete revision carries forward the partial idea from Codex and adds a concrete transfer example.</p></body></html>",
+          );
+          child.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: secondSessionId })}\n`);
+          child.stdout.write(`${JSON.stringify({ type: "result", result: "Revision transferred and completed." })}\n`);
+          child.exitCode = 0;
+          child.stdout.end();
+          child.stderr.end();
+          callback();
+          queueMicrotask(() => child.emit("close", 0, null));
+        }).catch((error) => {
+          child.exitCode = 1;
+          child.stderr.end(error.message);
+          child.stdout.end();
+          callback();
+          queueMicrotask(() => child.emit("close", 1, null));
+        });
+      },
+    });
+    return child;
+  };
+  const providers = {
+    codex: READY_CODEX,
+    claude: {
+      id: "claude",
+      available: true,
+      compatible: true,
+      authenticated: true,
+      ready: true,
+      models: [],
+    },
+  };
+  const server = createAppServer({ providerLookup: async (provider) => providers[provider], spawnProcess });
+  const failedBody = {
+    action: "revise",
+    course: "systems",
+    chapter: "foundations",
+    lesson,
+    provider: "codex",
+    annotationIds: [annotation.id],
+    operationId: "switch-source-test-1",
+  };
+  const first = await requestApp(server, { method: "POST", pathname: "/api/teacher", body: JSON.stringify(failedBody) });
+  const firstEvents = first.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const interruption = firstEvents.at(-1).interruption;
+  assert.equal(interruption.kind, "session-limit");
+  assert.equal(interruption.sessionId, firstSessionId);
+  assert.equal(interruption.hasPartialWork, true);
+  assert.equal(await readFile(path.join(course, lesson), "utf8"), originalLesson);
+
+  const replay = await requestApp(server, { method: "POST", pathname: "/api/teacher", body: JSON.stringify(failedBody) });
+  const replayEvents = replay.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(replayEvents.length, 1);
+  assert.equal(replayEvents[0].interruption.handoffId, interruption.handoffId);
+  assert.equal(calls.length, 1);
+
+  const switched = await requestApp(server, {
+    method: "POST",
+    pathname: "/api/teacher",
+    body: JSON.stringify({
+      ...failedBody,
+      provider: "claude",
+      operationId: "switch-target-test-1",
+      handoffId: interruption.handoffId,
+    }),
+  });
+  const switchedEvents = switched.body.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(switchedEvents.at(-1).type, "complete", switched.body.toString("utf8"));
+  assert.match(calls[1].prompt, /Previous teacher checkpoint/);
+  assert.match(transferredPartial, /Partial idea from Codex/);
+  assert.match(await readFile(path.join(course, lesson), "utf8"), /carries forward the partial idea from Codex/);
+  await assert.rejects(lstat(path.join(root, ".margin-teacher-handoffs", interruption.handoffId)), { code: "ENOENT" });
 });
 
 test("a teacher may build utilities in the selected course but cannot leave changes in another course", async (t) => {
@@ -1755,13 +2110,13 @@ test("reconciles manual edits and restores a tampered app-owned history store", 
   assert.equal((await readLectureHistory(course, lesson)).lectures[0].current.version, 2);
 });
 
-test("provider commands are foreground, ephemeral, and workspace-bound", () => {
+test("provider commands persist resumable sessions and stay workspace-bound", () => {
   const course = "/Users/example/learn/infra";
   const claude = providerCommand("claude", course, "/Users/example/learn");
   assert.equal(claude.cwd, "/Users/example/learn");
   assert.ok(claude.args.includes("dontAsk"));
   assert.ok(claude.args.includes("--verbose"));
-  assert.ok(claude.args.includes("--no-session-persistence"));
+  assert.ok(!claude.args.includes("--no-session-persistence"));
   assert.ok(claude.args.includes("--safe-mode"));
   assert.ok(claude.args.some((value) => value.includes("WebSearch,WebFetch")));
   assert.ok(!claude.args.includes("--setting-sources"));
@@ -1777,6 +2132,7 @@ test("provider commands are foreground, ephemeral, and workspace-bound", () => {
   assert.ok(codex.args.includes("--ignore-rules"));
   assert.deepEqual(codex.args.slice(codex.args.indexOf("--disable"), codex.args.indexOf("--disable") + 2), ["--disable", "hooks"]);
   assert.ok(codex.args.includes("--skip-git-repo-check"));
+  assert.ok(!codex.args.includes("--ephemeral"));
   assert.ok(!codex.args.includes("danger-full-access"));
 
   const configuredClaude = providerCommand("claude", course, "/Users/example/learn", { model: "sonnet", effort: "high" });
@@ -1794,6 +2150,22 @@ test("provider commands are foreground, ephemeral, and workspace-bound", () => {
   assert.equal(claude.args.includes("--effort"), false);
   assert.equal(codex.args.includes("--model"), false);
   assert.equal(codex.args.includes("-c"), false);
+
+  const sessionId = "12345678-1234-4123-8123-123456789abc";
+  const newClaudeSession = providerCommand("claude", course, "/Users/example/learn", { sessionId });
+  assert.deepEqual(
+    newClaudeSession.args.slice(newClaudeSession.args.indexOf("--session-id"), newClaudeSession.args.indexOf("--session-id") + 2),
+    ["--session-id", sessionId],
+  );
+  const resumedClaude = providerCommand("claude", course, "/Users/example/learn", { resumeSessionId: sessionId });
+  assert.deepEqual(
+    resumedClaude.args.slice(resumedClaude.args.indexOf("--resume"), resumedClaude.args.indexOf("--resume") + 2),
+    ["--resume", sessionId],
+  );
+  const resumedCodex = providerCommand("codex", course, "/Users/example/learn", { resumeSessionId: sessionId });
+  assert.deepEqual(resumedCodex.args.slice(resumedCodex.args.indexOf("exec"), resumedCodex.args.indexOf("exec") + 3), ["exec", "resume", "--json"]);
+  assert.ok(resumedCodex.args.includes(sessionId));
+  assert.throws(() => providerCommand("claude", course, "/Users/example/learn", { sessionId: "not-a-session" }), /Invalid teacher session id/);
 });
 
 test("validates provider model and thinking options", () => {
@@ -1844,11 +2216,11 @@ test("strips the bundled Codex catalog to safe model metadata", () => {
 test("checks provider command capabilities without pinning versions", () => {
   const claudeHelp = [
     "--print", "--verbose", "--input-format", "--output-format", "--include-partial-messages",
-    "--no-session-persistence", "--permission-mode", "--tools", "--allowed-tools", "--safe-mode",
+    "--resume", "--session-id", "--permission-mode", "--tools", "--allowed-tools", "--safe-mode",
     "--strict-mcp-config", "--no-chrome", "--model", "--effort",
   ].join(" ");
   assert.deepEqual(providerCompatibility("claude", claudeHelp), { compatible: true, missing: [] });
-  assert.deepEqual(providerCompatibility("codex", "--ask-for-approval --sandbox --cd --disable --model --config --search", "--json --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules"), {
+  assert.deepEqual(providerCompatibility("codex", "--ask-for-approval --sandbox --cd --disable --model --config --search", "resume --json --skip-git-repo-check --ignore-user-config --ignore-rules"), {
     compatible: true,
     missing: [],
   });
@@ -1877,6 +2249,11 @@ test("describes provider update transitions and bounded failures honestly", () =
 });
 
 test("normalizes provider JSONL into UI events", () => {
+  const sessionId = "12345678-1234-4123-8123-123456789abc";
+  assert.deepEqual(
+    parseProviderLine("codex", JSON.stringify({ type: "thread.started", thread_id: sessionId })),
+    { kind: "status", text: "Teacher started", sessionId },
+  );
   assert.deepEqual(
     parseProviderLine("codex", JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Done" } })),
     { kind: "summary", text: "Done" },
@@ -1892,8 +2269,8 @@ test("normalizes provider JSONL into UI events", () => {
     { kind: "activity", text: "Wrote spanish/vocabulary.json" },
   );
   assert.deepEqual(
-    parseProviderLine("claude", JSON.stringify({ type: "system", subtype: "init" })),
-    { kind: "status", text: "Teacher started" },
+    parseProviderLine("claude", JSON.stringify({ type: "system", subtype: "init", session_id: sessionId })),
+    { kind: "status", text: "Teacher started", sessionId },
   );
   assert.equal(parseProviderLine("claude", JSON.stringify({ type: "system", subtype: "hook_started" })), null);
   assert.deepEqual(
@@ -1911,6 +2288,18 @@ test("normalizes provider JSONL into UI events", () => {
   assert.deepEqual(
     parseProviderLine("claude", JSON.stringify({ type: "result", is_error: true, result: "Nope" })),
     { kind: "error", text: "Nope", terminal: "failure" },
+  );
+  assert.deepEqual(
+    parseProviderLine("claude", JSON.stringify({
+      type: "assistant",
+      error: "authentication_failed",
+      message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+    })),
+    { kind: "error", text: "Not logged in · Please run /login", terminal: "failure" },
+  );
+  assert.deepEqual(
+    parseProviderLine("claude", JSON.stringify({ type: "result", is_error: true, terminal_reason: "api_error" })),
+    { kind: "terminal", text: "", terminal: "failure" },
   );
   const longSummary = "a".repeat(4500);
   for (const event of [

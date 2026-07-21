@@ -9,6 +9,7 @@ const LESSON_PATH = /^lessons\/[a-zA-Z0-9][a-zA-Z0-9._-]*\.html$/;
 const ANNOTATION_ID = /^[a-zA-Z0-9_-]{1,128}$/;
 const MODEL_ID = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/;
 const MAX_MODEL_ID_LENGTH = 120;
+const SESSION_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -1407,6 +1408,13 @@ export function normalizeProviderOptions(provider, options = {}, models = []) {
 
 export function providerCommand(provider, courseRoot, appRoot, options = {}) {
   const { model, effort } = normalizeProviderOptions(provider, options);
+  const sessionId = typeof options.sessionId === "string" && SESSION_ID.test(options.sessionId) ? options.sessionId : "";
+  const resumeSessionId = typeof options.resumeSessionId === "string" && SESSION_ID.test(options.resumeSessionId)
+    ? options.resumeSessionId
+    : "";
+  if (options.sessionId && !sessionId) throw new Error("Invalid teacher session id");
+  if (options.resumeSessionId && !resumeSessionId) throw new Error("Invalid teacher resume session id");
+  if (sessionId && resumeSessionId) throw new Error("Choose a new or resumed teacher session, not both");
   if (provider === "claude") {
     const permissionPath = `//${path.resolve(appRoot).replace(/^\/+/, "")}/**`;
     const selectionArgs = [
@@ -1419,9 +1427,9 @@ export function providerCommand(provider, courseRoot, appRoot, options = {}) {
         "--print",
         "--verbose",
         ...selectionArgs,
+        ...(resumeSessionId ? ["--resume", resumeSessionId] : sessionId ? ["--session-id", sessionId] : []),
         "--input-format", "text",
         "--output-format", "stream-json",
-        "--no-session-persistence",
         "--permission-mode", "dontAsk",
         "--tools", "Skill,Read,Glob,Grep,Edit,Write,WebSearch,WebFetch",
         "--allowed-tools", `Skill,WebSearch,WebFetch,Edit(${permissionPath}),Write(${permissionPath})`,
@@ -1437,23 +1445,20 @@ export function providerCommand(provider, courseRoot, appRoot, options = {}) {
       ...(model ? ["--model", model] : []),
       ...(effort ? ["-c", `model_reasoning_effort=\"${effort}\"`] : []),
     ];
+    const common = [
+      "--ask-for-approval", "never",
+      "--sandbox", "workspace-write",
+      "--cd", appRoot,
+      "--search",
+      "--disable", "hooks",
+      ...selectionArgs,
+      "exec",
+    ];
     return {
       command: "codex",
-      args: [
-        "--ask-for-approval", "never",
-        "--sandbox", "workspace-write",
-        "--cd", appRoot,
-        "--search",
-        "--disable", "hooks",
-        ...selectionArgs,
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "-",
-      ],
+      args: resumeSessionId
+        ? [...common, "resume", "--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", resumeSessionId, "-"]
+        : [...common, "--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "-"],
       cwd: appRoot,
     };
   }
@@ -1469,7 +1474,8 @@ const PROVIDER_PROBES = {
       "--verbose",
       "--input-format",
       "--output-format",
-      "--no-session-persistence",
+      "--resume",
+      "--session-id",
       "--permission-mode",
       "--tools",
       "--allowed-tools",
@@ -1487,7 +1493,7 @@ const PROVIDER_PROBES = {
     help: ["--help"],
     execHelp: ["exec", "--help"],
     required: ["--ask-for-approval", "--sandbox", "--cd", "--disable", "--model", "--config", "--search"],
-    execRequired: ["--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules"],
+    execRequired: ["resume", "--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules"],
     auth: ["login", "status"],
     update: ["update"],
   },
@@ -1771,7 +1777,9 @@ export function parseProviderLine(provider, line) {
   try {
     const event = JSON.parse(trimmed);
     if (provider === "codex") {
-      if (event.type === "thread.started") return { kind: "status", text: "Teacher started" };
+      if (event.type === "thread.started") {
+        return { kind: "status", text: "Teacher started", ...(SESSION_ID.test(event.thread_id || "") ? { sessionId: event.thread_id } : {}) };
+      }
       if (event.type === "turn.started" || event.type === "item.started") return null;
       if (event.type === "turn.failed" || event.type === "error") {
         return { kind: "error", text: event.message || event.error?.message || "Codex failed", terminal: "failure" };
@@ -1787,15 +1795,29 @@ export function parseProviderLine(provider, line) {
     }
 
     if (event.type === "system") {
-      return event.subtype === "init" ? { kind: "status", text: "Teacher started" } : null;
+      return event.subtype === "init"
+        ? { kind: "status", text: "Teacher started", ...(SESSION_ID.test(event.session_id || "") ? { sessionId: event.session_id } : {}) }
+        : null;
     }
     if (event.type === "assistant") {
       const content = Array.isArray(event.message?.content) ? event.message.content : [];
+      if (event.error) {
+        const message = content
+          .filter((item) => item.type === "text" && item.text)
+          .map((item) => item.text)
+          .join(" ") || (typeof event.error === "string" ? event.error : event.error?.message);
+        return { kind: "error", text: compactProviderText(message || "Claude Code failed", 3000), terminal: "failure" };
+      }
       const activities = [...new Set(content.filter((item) => item.type === "tool_use").map(claudeToolActivity))];
       return activities.length ? { kind: "activity", text: activities.slice(0, 3).join(" · ") } : null;
     }
     if (event.type === "result") {
-      if (event.is_error) return { kind: "error", text: event.result || "Claude Code failed", terminal: "failure" };
+      if (event.is_error) {
+        const message = event.result || (typeof event.error === "string" ? event.error : event.error?.message);
+        return message
+          ? { kind: "error", text: compactProviderText(message, 3000), terminal: "failure" }
+          : { kind: "terminal", text: "", terminal: "failure" };
+      }
       if (event.result) return { kind: "summary", text: compactProviderText(event.result, 3000), terminal: "success" };
       return { kind: "terminal", text: "", terminal: "success" };
     }

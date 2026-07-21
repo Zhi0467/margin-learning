@@ -63,6 +63,7 @@ const state = {
   historyRequestKey: "",
   historyPreviewCommit: "",
   activeRun: null,
+  interruptedRun: null,
   navigationGeneration: 0,
   courseDiagnosticsSignature: "",
   staleLectures: new Set(),
@@ -90,7 +91,8 @@ const elements = Object.fromEntries([
   "teacher-effort-select", "teacher-config-hint",
   "revise-button", "revise-detail", "next-button", "next-detail", "teacher-run", "teacher-dock", "run-title",
   "run-activity", "open-run-details", "run-details-view", "close-run-details", "run-detail-title",
-  "run-detail-activity", "run-log", "cancel-run", "history-view", "close-history", "history-title", "history-summary",
+  "run-detail-activity", "run-log", "cancel-run", "run-recovery-actions", "resume-run", "switch-run", "abandon-run",
+  "history-view", "close-history", "history-title", "history-summary",
   "history-list", "history-preview-empty", "history-preview-frame", "toast",
 ].map((id) => [id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), document.getElementById(id)]));
 
@@ -179,6 +181,11 @@ async function clearOperation(operationId) {
   }
 }
 
+async function clearRunReceipts(operationId, handoffId = "") {
+  await clearOperation(operationId);
+  if (handoffId && handoffId !== operationId) await clearOperation(handoffId);
+}
+
 async function reconcileOperation(operationId, { courseId = "", timeoutMilliseconds = 10000 } = {}) {
   const deadline = Date.now() + timeoutMilliseconds;
   try {
@@ -187,6 +194,9 @@ async function reconcileOperation(operationId, { courseId = "", timeoutMilliseco
       const result = await api(`/api/operations/${encodeURIComponent(operationId)}${query}`);
       if (result.status === "complete" && result.event?.type === "complete") {
         return { status: "complete", event: result.event };
+      }
+      if (result.status === "failed" && result.failure) {
+        return { status: "failed", failure: result.failure, handoff: result.handoff || null };
       }
       if (result.status === "unknown") return { status: "unknown" };
       if (result.status === "deferred") return { status: "deferred", task: result.task };
@@ -237,11 +247,11 @@ function schedulePendingOperationReconciliation() {
   if (!pendingOperations().length) return;
   pendingReconciliationTimer = setTimeout(() => {
     pendingReconciliationTimer = 0;
-    if (!state.activeRun && !state.newCourseRun) void reconcilePendingOperationsAtStartup();
+    if (!state.activeRun && !state.newCourseRun && !state.interruptedRun) void reconcilePendingOperationsAtStartup();
   }, 1000);
 }
 
-async function requestOperationCancellation(run, { courseId = "" } = {}) {
+async function requestOperationCancellation(run, { courseId = "", mode = "cancel" } = {}) {
   run.cancelRequested = true;
   if (!run.operationId) {
     run.controller?.abort();
@@ -250,7 +260,7 @@ async function requestOperationCancellation(run, { courseId = "" } = {}) {
   const query = courseId ? `?course=${encodeURIComponent(courseId)}` : "";
   return api(`/api/operations/${encodeURIComponent(run.operationId)}/cancel${query}`, {
     method: "POST",
-    body: "{}",
+    body: JSON.stringify({ mode }),
   });
 }
 
@@ -600,7 +610,7 @@ function renderNewCourseFormState() {
   const opening = run?.phase === "opening";
   const finishing = run?.phase === "committed";
   const provider = state.providers.find((item) => item.id === state.selectedTeacher);
-  const anotherTaskRunning = Boolean(state.activeRun);
+  const anotherTaskRunning = Boolean(state.activeRun || state.interruptedRun);
   elements.newCourseForm.setAttribute("aria-busy", String(busy));
   elements.newCourseName.disabled = busy;
   elements.newCourseRequest.disabled = busy;
@@ -654,8 +664,10 @@ function renderNewCourseTeacherFields(selectedProvider) {
   elements.newCourseEffortSelect.value = settings.effort;
   elements.newCourseTeacherStatus.textContent = state.activeRun
     ? "Another teacher task is already running. You can create this course when it finishes."
+    : state.interruptedRun
+      ? "Resolve the paused or interrupted teacher checkpoint before starting another course."
     : selectedTeacherStatus(selectedProvider);
-  elements.newCourseTeacherStatus.dataset.state = providerReady(selectedProvider) && !state.activeRun
+  elements.newCourseTeacherStatus.dataset.state = providerReady(selectedProvider) && !state.activeRun && !state.interruptedRun
     ? "ready"
     : "attention";
   elements.newCourseConfigHint.textContent = teacherConfigHint(selectedProvider);
@@ -708,8 +720,13 @@ function renderLibrary() {
 }
 
 function deletionBlocked() {
-  if (!state.activeRun && !state.newCourseRun) return false;
-  showToast("Wait for the current teacher action to finish before deleting course material.", { error: true });
+  if (!state.activeRun && !state.newCourseRun && !state.interruptedRun) return false;
+  showToast(
+    state.interruptedRun
+      ? "Resume, switch, or abandon the interrupted teacher checkpoint before deleting course material."
+      : "Wait for the current teacher action to finish before deleting course material.",
+    { error: true },
+  );
   return true;
 }
 
@@ -832,6 +849,10 @@ function openNewCourseDialog() {
     openRunDetails();
     return;
   }
+  if (state.interruptedRun) {
+    openRunDetails();
+    return;
+  }
   elements.newCourseForm.reset();
   resetNewCourseProgress();
   renderProviders();
@@ -847,13 +868,13 @@ function closeNewCourseDialog({ force = false } = {}) {
   if (elements.newCourseDialog.open) elements.newCourseDialog.close();
 }
 
-async function cancelNewCourseCreation() {
+async function cancelNewCourseCreation({ mode = "cancel" } = {}) {
   const run = state.newCourseRun;
   if (!run || !["creating", "running"].includes(run.phase)) return;
   run.phase = "cancelling";
-  setRunState("running", "Stopping the teacher and rolling back unfinished work…");
+  setRunState("running", mode === "pause" ? "Saving a checkpoint and pausing the teacher…" : "Stopping the teacher and rolling back unfinished work…");
   try {
-    const result = await requestOperationCancellation(run);
+    const result = await requestOperationCancellation(run, { mode });
     if (state.newCourseRun !== run) return;
     if (result.status === "finishing" || result.status === "complete") {
       run.phase = "committed";
@@ -892,16 +913,25 @@ async function applyCourseCreationCompletion(completedEvent, run) {
   showTaskCompletion(shouldOpen ? "Course and first lecture created." : "Course and first lecture created in the background.");
 }
 
-async function createNewCourse(event) {
-  event.preventDefault();
+async function createNewCourse(event, { recovery = null, providerOverride = "" } = {}) {
+  event?.preventDefault?.();
   if (state.activeRun || state.newCourseRun) return;
-  const title = elements.newCourseName.value.trim();
-  const initialRequest = elements.newCourseRequest.value.trim();
+  if (!recovery && state.interruptedRun) {
+    openRunDetails();
+    return;
+  }
+  if (recovery && state.interruptedRun?.handoffId !== recovery.handoffId) return;
+  const previousRecovery = recovery
+    ? { ...recovery, annotationIds: [...(recovery.annotationIds || [])] }
+    : null;
+  const title = recovery?.title || elements.newCourseName.value.trim();
+  const initialRequest = recovery?.initialRequest || elements.newCourseRequest.value.trim();
   if (!title || !initialRequest) {
     elements.newCourseForm.reportValidity();
     return;
   }
-  const providerInfo = state.providers.find((item) => item.id === state.selectedTeacher);
+  const provider = providerOverride || recovery?.provider || state.selectedTeacher;
+  const providerInfo = state.providers.find((item) => item.id === provider);
   if (!providerReady(providerInfo)) {
     setNewCourseProgress(
       "error",
@@ -912,8 +942,16 @@ async function createNewCourse(event) {
     return;
   }
 
-  const provider = state.selectedTeacher;
-  const { model, effort } = { ...teacherSettings(provider) };
+  const sameTeacherResume = Boolean(recovery && provider === recovery.provider && recovery.sessionId);
+  const settings = sameTeacherResume
+    ? { model: recovery.model || "", effort: recovery.effort || "" }
+    : { ...teacherSettings(provider) };
+  const { model, effort } = settings;
+  const handoffId = recovery?.handoffId || "";
+  const resumeSessionId = sameTeacherResume ? recovery.sessionId : "";
+  state.selectedTeacher = provider;
+  persistPreference("margin:teacher", provider);
+  state.interruptedRun = null;
   const controller = new AbortController();
   const run = {
     controller,
@@ -922,6 +960,10 @@ async function createNewCourse(event) {
     provider,
     model,
     effort,
+    title,
+    initialRequest,
+    handoffId,
+    resumeSessionId,
     operationId: "",
     cancelRequested: false,
     navigationGeneration: state.navigationGeneration,
@@ -939,14 +981,23 @@ async function createNewCourse(event) {
   let operationId = "";
 
   try {
-    const signature = await operationSignature([title, initialRequest, provider, model, effort]);
-    operationId = await operationForRequest(signature, { kind: "course-create" });
+    const signature = await operationSignature([title, initialRequest, provider, model, effort, handoffId, resumeSessionId]);
+    operationId = await operationForRequest(signature, {
+      kind: "course-create",
+      provider,
+      model,
+      effort,
+      title,
+      initialRequest,
+      handoffId,
+    });
     run.operationId = operationId;
+    elements.cancelRun.disabled = false;
     const response = await fetch("/api/courses/create", {
       method: "POST",
       headers: authenticatedHeaders({ "Content-Type": "application/json" }),
       signal: controller.signal,
-      body: JSON.stringify({ title, initialRequest, provider, model, effort, operationId }),
+      body: JSON.stringify({ title, initialRequest, provider, model, effort, operationId, handoffId, resumeSessionId }),
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -954,7 +1005,11 @@ async function createNewCourse(event) {
     }
     run.phase = "running";
     await readNdjson(response, (teacherEvent) => {
-      if (teacherEvent.type === "error") throw new Error(teacherEvent.text || "The teacher could not create the first lecture");
+      if (teacherEvent.type === "error") {
+        const teacherError = new Error(teacherEvent.text || "The teacher could not create the first lecture");
+        teacherError.interruption = teacherEvent.interruption || null;
+        throw teacherError;
+      }
       if (teacherEvent.type === "complete") {
         completedEvent = teacherEvent;
         committed = true;
@@ -974,7 +1029,7 @@ async function createNewCourse(event) {
       }
     });
     if (!completedEvent) throw new Error("The teacher stopped without completing the first lecture");
-    await clearOperation(operationId);
+    await clearRunReceipts(operationId, handoffId);
     await applyCourseCreationCompletion(completedEvent, run);
   } catch (error) {
     if (!committed && operationId) {
@@ -982,13 +1037,16 @@ async function createNewCourse(event) {
       if (resolution.status === "complete") {
         completedEvent = resolution.event;
         committed = true;
-        await clearOperation(operationId);
+        await clearRunReceipts(operationId, handoffId);
         try {
           await applyCourseCreationCompletion(completedEvent, run);
           return;
         } catch (openError) {
           error = openError;
         }
+      } else if (resolution.status === "failed") {
+        await adoptTeacherInterruption(run, resolution.failure, previousRecovery, error.message);
+        return;
       } else if (resolution.status === "running") {
         setRunState("running", "The activity stream changed, but teaching continues safely in the background.");
         const terminal = await waitForOperationTerminal(operationId, {
@@ -1001,13 +1059,16 @@ async function createNewCourse(event) {
         if (terminal.status === "complete") {
           completedEvent = terminal.event;
           committed = true;
-          await clearOperation(operationId);
+          await clearRunReceipts(operationId, handoffId);
           try {
             await applyCourseCreationCompletion(completedEvent, run);
             return;
           } catch (openError) {
             error = openError;
           }
+        } else if (terminal.status === "failed") {
+          await adoptTeacherInterruption(run, terminal.failure, previousRecovery, error.message);
+          return;
         } else if (terminal.status === "unknown") {
           await clearOperation(operationId);
         } else {
@@ -1037,6 +1098,11 @@ async function createNewCourse(event) {
       showToast(message, { error: true });
       return;
     }
+    if (error.interruption) {
+      await adoptTeacherInterruption(run, error.interruption, previousRecovery, error.message);
+      return;
+    }
+    if (restoreTeacherInterruption(previousRecovery, error.message)) return;
     if (!controller.signal.aborted) controller.abort();
     const cancelled = run.cancelRequested || error.name === "AbortError";
     const message = cancelled ? "Course creation cancelled." : error.message;
@@ -1236,7 +1302,7 @@ function renderMessages() {
   }
 
   const provider = state.providers.find((item) => item.id === state.selectedTeacher);
-  const running = Boolean(state.activeRun || state.newCourseRun);
+  const running = Boolean(state.activeRun || state.newCourseRun || state.interruptedRun);
   const runBlocksNotes = Boolean(state.activeRun?.courseId) && state.activeRun.courseId === state.course?.id;
   elements.saveMessage.disabled = runBlocksNotes;
   elements.saveMessage.title = runBlocksNotes
@@ -1259,7 +1325,7 @@ function renderProviders() {
   elements.teacherCurrentName.textContent = selectedName;
   elements.teacherCurrentConfig.textContent = selectedProvider ? teacherConfigSummary(selectedProvider) : "No CLI available";
   renderProviderGlyph(elements.teacherCurrentGlyph, selectedProvider);
-  const busy = Boolean(state.activeRun || state.newCourseRun);
+  const busy = Boolean(state.activeRun || state.newCourseRun || state.interruptedRun);
   const updating = state.activeRun?.action === "update";
   elements.teacherMenuButton.disabled = !state.providers.length;
   elements.teacherMenuButton.title = selectedProvider?.error || providerStatus(selectedProvider);
@@ -1307,6 +1373,7 @@ function renderProviders() {
   renderNewCourseTeacherFields(selectedProvider);
   elements.backToLibrary.disabled = false;
   renderMessages();
+  renderRunRecoveryActions();
 }
 
 async function loadAnnotations({
@@ -1534,7 +1601,7 @@ function closeHistoryView() {
 
 async function restoreHistoryCommit(commitId) {
   const lesson = currentLesson();
-  if (!state.course || !lesson || state.activeRun) return;
+  if (!state.course || !lesson || state.activeRun || state.newCourseRun || state.interruptedRun) return;
   const courseId = state.course.id;
   const navigationGeneration = state.navigationGeneration;
   try {
@@ -1795,6 +1862,29 @@ function backgroundRun() {
   return state.activeRun || state.newCourseRun;
 }
 
+function runTitle(run) {
+  if (run.action === "create") return `${providerName(run.provider)} · new course`;
+  return `${providerName(run.provider)} · ${run.action === "revise" ? "revision" : "next lecture"}`;
+}
+
+function renderRunRecoveryActions() {
+  const run = state.interruptedRun;
+  elements.runRecoveryActions.hidden = !run;
+  if (!run) return;
+  const sameProvider = state.providers.find((provider) => provider.id === run.provider);
+  const alternateId = run.provider === "claude" ? "codex" : "claude";
+  const alternateProvider = state.providers.find((provider) => provider.id === alternateId);
+  elements.resumeRun.textContent = `${run.sessionId ? "Resume" : "Retry"} ${providerName(run.provider)}`;
+  elements.resumeRun.disabled = run.abandoning || !run.handoffId || !providerReady(sameProvider);
+  elements.resumeRun.title = sameProvider?.error || "Continue the saved teacher session and filesystem checkpoint";
+  elements.switchRun.textContent = `Switch to ${providerName(alternateId)}`;
+  elements.switchRun.dataset.provider = alternateId;
+  elements.switchRun.disabled = run.abandoning || !run.handoffId || !providerReady(alternateProvider);
+  elements.switchRun.title = alternateProvider?.error || "Start the other teacher with the saved filesystem checkpoint";
+  elements.abandonRun.disabled = run.abandoning || !run.handoffId;
+  elements.abandonRun.textContent = run.abandoning ? "Abandoning…" : "Abandon";
+}
+
 function placeTeacherRun() {
   if (state.view === "library") {
     if (elements.teacherRun.parentElement !== elements.libraryTaskHost) {
@@ -1811,27 +1901,35 @@ function placeTeacherRun() {
 
 function setRunState(kind, text) {
   const run = backgroundRun();
+  const interrupted = state.interruptedRun;
   const cancelling = run?.phase === "cancelling";
   const finishing = run?.phase === "committed" || run?.phase === "opening";
+  const awaitingReceipt = kind === "running" && run && ["create", "revise", "next"].includes(run.action) && !run.operationId;
   const updateInProgress = kind === "running" && run?.action === "update";
+  const checkpointSummary = interrupted?.hasPartialWork ? "partial work saved" : "a checkpoint saved";
   elements.teacherRun.hidden = false;
   placeTeacherRun();
   elements.teacherRun.dataset.state = kind;
   elements.runDetailsView.dataset.state = kind;
-  elements.cancelRun.hidden = updateInProgress;
-  elements.cancelRun.disabled = cancelling || finishing;
-  elements.cancelRun.textContent = cancelling ? "Cancelling…" : finishing ? "Finishing…" : kind === "running" || run ? "Cancel" : "Dismiss";
+  elements.cancelRun.hidden = updateInProgress || Boolean(interrupted);
+  elements.cancelRun.disabled = cancelling || finishing || awaitingReceipt;
+  elements.cancelRun.textContent = cancelling ? "Pausing…" : finishing ? "Finishing…" : kind === "running" || run ? "Pause" : "Dismiss";
   elements.runActivity.textContent = updateInProgress
     ? "Update in progress."
     : cancelling
-    ? "Cancelling in the background…"
+    ? "Saving a checkpoint and stopping…"
     : kind === "running"
     ? "Working in the background…"
-    : kind === "done" ? "Finished in the background." : "Teacher stopped.";
+    : kind === "done"
+    ? "Finished in the background."
+    : kind === "paused"
+    ? `Paused with ${checkpointSummary}.`
+    : interrupted ? `Interrupted with ${checkpointSummary}.` : "Teacher stopped.";
   elements.runDetailTitle.textContent = elements.runTitle.textContent;
   elements.runDetailActivity.textContent = updateInProgress
     ? `Update in progress${text ? ` · ${text}` : "."}`
     : text;
+  renderRunRecoveryActions();
 }
 
 function openRunDetails() {
@@ -1956,6 +2054,101 @@ async function applyTeacherCompletion({ action, courseId, lesson }, completedEve
   }
 }
 
+function applyTeacherInterruption(run, failure, fallbackMessage = "Teacher stopped before completing the task.") {
+  const message = failure?.message || fallbackMessage;
+  if (!failure?.handoffId) {
+    appendRunLog(message, "error");
+    setRunState("error", message);
+    showToast(message, { error: true });
+    return false;
+  }
+  run.phase = "interrupted";
+  state.interruptedRun = {
+    action: run.action,
+    courseId: run.courseId || "",
+    chapterId: run.chapterId || "",
+    lesson: run.lesson || "",
+    annotationIds: [...(run.annotationIds || [])],
+    title: run.title || "",
+    initialRequest: run.initialRequest || "",
+    provider: failure.provider || run.provider,
+    model: run.model || "",
+    effort: run.effort || "",
+    handoffId: failure.handoffId,
+    sessionId: failure.sessionId || "",
+    kind: failure.kind || "failed",
+    hasPartialWork: Boolean(failure.hasPartialWork),
+    message,
+  };
+  elements.runTitle.textContent = runTitle(state.interruptedRun);
+  appendRunLog(message, failure.kind === "paused" ? "status" : "error");
+  setRunState(failure.kind === "paused" ? "paused" : "error", message);
+  showToast(message, { error: failure.kind !== "paused" });
+  return true;
+}
+
+async function adoptTeacherInterruption(run, failure, previousRecovery = null, fallbackMessage = "") {
+  if (!failure?.handoffId && previousRecovery?.handoffId) {
+    return restoreTeacherInterruption(previousRecovery, failure?.message || fallbackMessage);
+  }
+  if (previousRecovery?.handoffId && previousRecovery.handoffId !== failure?.handoffId) {
+    await clearOperation(previousRecovery.handoffId);
+  }
+  return applyTeacherInterruption(run, failure, fallbackMessage);
+}
+
+function restoreTeacherInterruption(recovery, reason) {
+  if (!recovery?.handoffId) return false;
+  state.interruptedRun = { ...recovery, annotationIds: [...(recovery.annotationIds || [])] };
+  elements.runTitle.textContent = runTitle(state.interruptedRun);
+  const message = `${reason} The saved checkpoint is still available.`;
+  appendRunLog(message, "error");
+  setRunState(recovery.kind === "paused" ? "paused" : "error", message);
+  showToast(message, { error: true });
+  return true;
+}
+
+async function continueInterruptedRun(provider) {
+  const recovery = state.interruptedRun;
+  if (!recovery || recovery.abandoning) return;
+  if (recovery.action === "create") {
+    await createNewCourse(null, { recovery, providerOverride: provider });
+  } else {
+    await runTeacher(recovery.action, { recovery, providerOverride: provider });
+  }
+}
+
+async function abandonInterruptedRun() {
+  const recovery = state.interruptedRun;
+  if (!recovery?.handoffId || recovery.abandoning) return;
+  recovery.abandoning = true;
+  renderRunRecoveryActions();
+  try {
+    const response = await fetch(`/api/teacher-handoffs/${encodeURIComponent(recovery.handoffId)}`, {
+      method: "DELETE",
+      headers: authenticatedHeaders(),
+    });
+    if (!response.ok && response.status !== 404) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `Checkpoint removal failed (${response.status})`);
+    }
+    await clearOperation(recovery.handoffId);
+    if (state.interruptedRun !== recovery) return;
+    state.interruptedRun = null;
+    closeRunDetails();
+    elements.teacherRun.hidden = true;
+    placeTeacherRun();
+    resetRunLog();
+    renderProviders();
+    schedulePendingOperationReconciliation();
+    showToast(recovery.hasPartialWork ? "Partial teacher progress abandoned." : "Teacher checkpoint abandoned.");
+  } catch (error) {
+    recovery.abandoning = false;
+    renderRunRecoveryActions();
+    showToast(`Could not abandon the checkpoint: ${error.message}`, { error: true });
+  }
+}
+
 function selectedTeacherAnnotationIds(action, chapter, lesson) {
   const chapterLessons = new Set(chapter.lectures.map((item) => item.path));
   return state.annotations
@@ -1965,34 +2158,56 @@ function selectedTeacherAnnotationIds(action, chapter, lesson) {
     .sort();
 }
 
-async function runTeacher(action) {
-  if (state.activeRun || state.newCourseRun || !currentLesson()) return;
-  const checkedProvider = state.providers.find((item) => item.id === state.selectedTeacher);
+async function runTeacher(action, { recovery = null, providerOverride = "" } = {}) {
+  if (state.activeRun || state.newCourseRun) return;
+  if (!recovery && state.interruptedRun) {
+    openRunDetails();
+    return;
+  }
+  if (!recovery && !currentLesson()) return;
+  if (recovery && state.interruptedRun?.handoffId !== recovery.handoffId) return;
+  const previousRecovery = recovery
+    ? { ...recovery, annotationIds: [...(recovery.annotationIds || [])] }
+    : null;
+  const provider = providerOverride || recovery?.provider || state.selectedTeacher;
+  const checkedProvider = state.providers.find((item) => item.id === provider);
   if (!providerReady(checkedProvider)) {
     showToast(checkedProvider?.error || "The selected teacher is not ready.", { error: true });
     return;
   }
   const controller = new AbortController();
-  const courseId = state.course.id;
-  const lesson = state.documentPath;
-  const chapter = currentChapter();
-  if (!chapter) return;
-  const provider = state.selectedTeacher;
-  const { model, effort } = { ...teacherSettings(provider) };
-  const annotationIds = selectedTeacherAnnotationIds(action, chapter, lesson);
+  const chapter = recovery ? null : currentChapter();
+  if (!recovery && !chapter) return;
+  const courseId = recovery?.courseId || state.course.id;
+  const lesson = recovery?.lesson || state.documentPath;
+  const chapterId = recovery?.chapterId || chapter.id;
+  const sameTeacherResume = Boolean(recovery && provider === recovery.provider && recovery.sessionId);
+  const settings = sameTeacherResume
+    ? { model: recovery.model || "", effort: recovery.effort || "" }
+    : { ...teacherSettings(provider) };
+  const { model, effort } = settings;
+  const annotationIds = recovery ? [...(recovery.annotationIds || [])] : selectedTeacherAnnotationIds(action, chapter, lesson);
+  const handoffId = recovery?.handoffId || "";
+  const resumeSessionId = sameTeacherResume ? recovery.sessionId : "";
+  state.selectedTeacher = provider;
+  persistPreference("margin:teacher", provider);
+  state.interruptedRun = null;
   closeTeacherMenu();
   const run = {
     controller,
     phase: "running",
     action,
     courseId,
-    chapterId: chapter.id,
+    chapterId,
     lesson,
+    annotationIds,
     provider,
     model,
     effort,
     operationId: "",
     cancelRequested: false,
+    handoffId,
+    resumeSessionId,
   };
   state.activeRun = run;
   resetRunLog();
@@ -2005,15 +2220,21 @@ async function runTeacher(action) {
   let operationId = "";
 
   try {
-    const signature = await operationSignature([action, courseId, chapter.id, lesson, provider, model, effort, annotationIds]);
+    const signature = await operationSignature([action, courseId, chapterId, lesson, provider, model, effort, annotationIds, handoffId, resumeSessionId]);
     operationId = await operationForRequest(signature, {
       kind: "teacher",
       action,
       courseId,
-      chapterId: chapter.id,
+      chapterId,
       lesson,
+      provider,
+      model,
+      effort,
+      annotationIds,
+      handoffId,
     });
     run.operationId = operationId;
+    elements.cancelRun.disabled = false;
     const response = await fetch("/api/teacher", {
       method: "POST",
       headers: authenticatedHeaders({ "Content-Type": "application/json" }),
@@ -2022,12 +2243,14 @@ async function runTeacher(action) {
         provider,
         action,
         course: courseId,
-        chapter: chapter.id,
+        chapter: chapterId,
         lesson,
         model,
         effort,
         annotationIds,
         operationId,
+        handoffId,
+        resumeSessionId,
       }),
     });
     if (!response.ok) {
@@ -2035,7 +2258,11 @@ async function runTeacher(action) {
       throw new Error(payload.error || `Teacher action failed (${response.status})`);
     }
     await readNdjson(response, (event) => {
-      if (event.type === "error") throw new Error(event.text);
+      if (event.type === "error") {
+        const teacherError = new Error(event.text);
+        teacherError.interruption = event.interruption || null;
+        throw teacherError;
+      }
       if (event.type === "complete") {
         completedEvent = event;
         committed = true;
@@ -2054,7 +2281,7 @@ async function runTeacher(action) {
       if (event.type === "summary" || event.type === "message") appendRunLog(event.text, "summary");
     });
     if (!completedEvent) throw new Error("The teacher stopped without completing the action");
-    await clearOperation(operationId);
+    await clearRunReceipts(operationId, handoffId);
     await applyTeacherCompletion(run, completedEvent);
   } catch (error) {
     if (!committed && operationId) {
@@ -2065,13 +2292,16 @@ async function runTeacher(action) {
         if (state.activeRun?.controller === controller) state.activeRun.phase = "committed";
         appendRunLog(completedEvent.text || "Teacher action completed.", "summary");
         setRunState("done", action === "revise" ? "Lecture revised." : "Next lecture created.");
-        await clearOperation(operationId);
+        await clearRunReceipts(operationId, handoffId);
         try {
           await applyTeacherCompletion(run, completedEvent);
           return;
         } catch (refreshError) {
           error = refreshError;
         }
+      } else if (resolution.status === "failed") {
+        await adoptTeacherInterruption(run, resolution.failure, previousRecovery, error.message);
+        return;
       } else if (resolution.status === "running") {
         setRunState("running", "The activity stream changed; teaching continues safely in the background.");
         const terminal = await waitForOperationTerminal(operationId, {
@@ -2086,13 +2316,16 @@ async function runTeacher(action) {
           if (state.activeRun?.controller === controller) state.activeRun.phase = "committed";
           appendRunLog(completedEvent.text || "Teacher action completed.", "summary");
           setRunState("done", action === "revise" ? "Lecture revised." : "Next lecture created.");
-          await clearOperation(operationId);
+          await clearRunReceipts(operationId, handoffId);
           try {
             await applyTeacherCompletion(run, completedEvent);
             return;
           } catch (refreshError) {
             error = refreshError;
           }
+        } else if (terminal.status === "failed") {
+          await adoptTeacherInterruption(run, terminal.failure, previousRecovery, error.message);
+          return;
         } else if (terminal.status === "unknown") {
           await clearOperation(operationId);
         } else {
@@ -2121,6 +2354,11 @@ async function runTeacher(action) {
       showToast(message, { error: true });
       return;
     }
+    if (error.interruption) {
+      await adoptTeacherInterruption(run, error.interruption, previousRecovery, error.message);
+      return;
+    }
+    if (restoreTeacherInterruption(previousRecovery, error.message)) return;
     if (!controller.signal.aborted) controller.abort();
     const message = run.cancelRequested || error.name === "AbortError" ? "Teacher action cancelled." : error.message;
     if (state.activeRun?.controller === controller) state.activeRun.phase = "settled";
@@ -2137,6 +2375,10 @@ async function runTeacher(action) {
 
 async function runProviderUpdate(provider) {
   if (state.activeRun || state.newCourseRun) return;
+  if (state.interruptedRun) {
+    openRunDetails();
+    return;
+  }
   const installed = state.providers.find((item) => item.id === provider);
   if (!installed?.available) {
     showToast(`${providerName(provider)} is not installed.`, { error: true });
@@ -2200,16 +2442,16 @@ async function runProviderUpdate(provider) {
 
 async function cancelRun() {
   if (state.newCourseRun) {
-    await cancelNewCourseCreation();
+    await cancelNewCourseCreation({ mode: "pause" });
     return;
   }
   if (state.activeRun?.action === "update") return;
   if (state.activeRun?.phase === "running") {
     const run = state.activeRun;
     run.phase = "cancelling";
-    setRunState("running", "Stopping the teacher and rolling back unfinished work…");
+    setRunState("running", "Saving a checkpoint and pausing the teacher…");
     try {
-      const result = await requestOperationCancellation(run, { courseId: run.courseId || "" });
+      const result = await requestOperationCancellation(run, { courseId: run.courseId || "", mode: "pause" });
       if (state.activeRun !== run) return;
       if (result.status === "finishing" || result.status === "complete") {
         run.phase = "committed";
@@ -2258,7 +2500,11 @@ async function resumePendingTeacherOperation(entry, task = {}) {
     courseId: entry.courseId,
     chapterId: entry.chapterId || "",
     lesson: entry.lesson,
+    annotationIds: [...(entry.annotationIds || [])],
     provider,
+    model: entry.model || "",
+    effort: entry.effort || "",
+    handoffId: entry.handoffId || "",
     operationId: entry.id,
     cancelRequested: false,
     resumed: true,
@@ -2288,8 +2534,12 @@ async function resumePendingTeacherOperation(entry, task = {}) {
       run.phase = "committed";
       appendRunLog(result.event.text || "Teacher action completed.", "summary");
       setRunState("done", entry.action === "revise" ? "Lecture revised." : "Next lecture created.");
-      await clearOperation(entry.id);
+      await clearRunReceipts(entry.id, run.handoffId);
       await applyTeacherCompletion(run, result.event);
+      return;
+    }
+    if (result.status === "failed") {
+      await adoptTeacherInterruption(run, result.failure, run.handoffId ? { handoffId: run.handoffId } : null);
       return;
     }
     if (result.status === "unknown") {
@@ -2317,6 +2567,11 @@ async function resumePendingCourseCreation(entry, task = {}) {
     phase: "running",
     action: "create",
     provider,
+    model: entry.model || "",
+    effort: entry.effort || "",
+    title: entry.title || "",
+    initialRequest: entry.initialRequest || "",
+    handoffId: entry.handoffId || "",
     operationId: entry.id,
     cancelRequested: false,
     resumed: true,
@@ -2342,8 +2597,12 @@ async function resumePendingCourseCreation(entry, task = {}) {
     });
     if (result.status === "complete") {
       run.phase = "committed";
-      await clearOperation(entry.id);
+      await clearRunReceipts(entry.id, run.handoffId);
       await applyCourseCreationCompletion(result.event, run);
+      return;
+    }
+    if (result.status === "failed") {
+      await adoptTeacherInterruption(run, result.failure, run.handoffId ? { handoffId: run.handoffId } : null);
       return;
     }
     if (result.status === "unknown") {
@@ -2378,6 +2637,7 @@ async function reconcilePendingOperationsAtStartup() {
   if (!entries.length) return;
   const remaining = [];
   const running = [];
+  const failed = [];
   let completed = 0;
   let deferred = 0;
   let unconfirmed = 0;
@@ -2394,11 +2654,17 @@ async function reconcilePendingOperationsAtStartup() {
       continue;
     }
     if (result.status === "unknown") continue;
+    if (result.status === "failed") {
+      failed.push({ entry, result });
+      remaining.push(entry);
+      continue;
+    }
     remaining.push(entry);
     if (result.status === "running") running.push({ entry, task: result.task });
     else if (result.status === "deferred") deferred += 1;
     else unconfirmed += 1;
   }
+  const interrupted = running.length ? null : failed[0] || null;
   if (remaining.length !== entries.length) {
     try {
       await persistCriticalPreference(PENDING_OPERATIONS_KEY, JSON.stringify(remaining));
@@ -2411,7 +2677,23 @@ async function reconcilePendingOperationsAtStartup() {
     await refreshCourses();
     showTaskCompletion(`${completed} completed background teacher ${completed === 1 ? "result was" : "results were"} recovered.`);
   }
-  if (running.length) {
+  if (interrupted) {
+    const { entry, result } = interrupted;
+    const handoff = result.handoff || {};
+    resetRunLog();
+    applyTeacherInterruption({
+      action: handoff.action || entry.action || (entry.kind === "course-create" ? "create" : ""),
+      courseId: handoff.courseId || entry.courseId || "",
+      chapterId: handoff.chapterId || entry.chapterId || "",
+      lesson: handoff.lesson || entry.lesson || "",
+      annotationIds: [...(entry.annotationIds || [])],
+      title: handoff.title || entry.title || "",
+      initialRequest: handoff.initialRequest || entry.initialRequest || "",
+      provider: result.failure.provider || handoff.provider || entry.provider || state.selectedTeacher,
+      model: entry.model || "",
+      effort: entry.effort || "",
+    }, result.failure);
+  } else if (running.length) {
     const [{ entry, task }] = running;
     showToast("Reconnected to the teacher working in the background.");
     if (entry.kind === "course-create") void resumePendingCourseCreation(entry, task);
@@ -2535,6 +2817,9 @@ elements.historyList.addEventListener("click", (event) => {
 elements.openRunDetails.addEventListener("click", openRunDetails);
 elements.closeRunDetails.addEventListener("click", closeRunDetails);
 elements.cancelRun.addEventListener("click", cancelRun);
+elements.resumeRun.addEventListener("click", () => continueInterruptedRun(state.interruptedRun?.provider));
+elements.switchRun.addEventListener("click", () => continueInterruptedRun(elements.switchRun.dataset.provider));
+elements.abandonRun.addEventListener("click", abandonInterruptedRun);
 window.addEventListener("resize", () => {
   hideSelectionPopover();
   normalizePanelWidths();

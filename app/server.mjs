@@ -49,6 +49,13 @@ import {
   recoverCourseTransactions,
   rollbackCourseTransaction,
 } from "./course-transaction.mjs";
+import {
+  classifyTeacherInterruption,
+  createTeacherHandoff,
+  discardTeacherHandoff,
+  readTeacherHandoff,
+  teacherHandoffPrompt,
+} from "./teacher-handoff.mjs";
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WORKSPACE_ROOT = path.resolve(process.env.MARGIN_WORKSPACE_ROOT || path.resolve(APP_DIR, ".."));
@@ -66,6 +73,7 @@ const ANNOTATION_BODY_LIMIT = 8 * 1024 * 1024;
 const RUN_EVENT_TEXT_LIMIT = 16 * 1024;
 const OPERATION_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const OPERATION_ANNOTATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const SESSION_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
 const MIME = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -85,12 +93,23 @@ let annotationMutation = Promise.resolve();
 
 const TASK_TERMINATION_GRACE_MS = 100;
 const TASK_FORCE_STOP_WAIT_MS = 1000;
+const TEACHER_STALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 function operationId(value = "") {
   const normalized = typeof value === "string" ? value.trim() : "";
   if (!normalized) return randomUUID();
   if (!OPERATION_ID.test(normalized)) throw new Error("Invalid teacher operation id");
   return normalized;
+}
+
+function teacherRecoveryRequest(body = {}) {
+  const handoffId = typeof body.handoffId === "string" && body.handoffId.trim()
+    ? operationId(body.handoffId)
+    : "";
+  const resumeSessionId = typeof body.resumeSessionId === "string" ? body.resumeSessionId.trim() : "";
+  if (resumeSessionId && !SESSION_ID.test(resumeSessionId)) throw new Error("Invalid teacher resume session id");
+  if (resumeSessionId && !handoffId) throw new Error("A resumed teacher session requires a handoff");
+  return { handoffId, resumeSessionId };
 }
 
 function requestHash(parts) {
@@ -104,9 +123,11 @@ function createOperationRequest(body, provider, id) {
     : typeof body.goal === "string" ? body.goal.trim() : "";
   const model = typeof body.model === "string" ? body.model.trim() : "";
   const effort = typeof body.effort === "string" ? body.effort.trim() : "";
+  const recovery = teacherRecoveryRequest(body);
   return {
     operationId: id,
-    requestHash: requestHash(["course-create", title, initialRequest, provider, model, effort]),
+    requestHash: requestHash(["course-create", title, initialRequest, provider, model, effort, recovery.handoffId, recovery.resumeSessionId]),
+    ...recovery,
   };
 }
 
@@ -125,10 +146,12 @@ function teacherOperationRequest(body, provider, action, courseId, chapterId, le
   const model = typeof body.model === "string" ? body.model.trim() : "";
   const effort = typeof body.effort === "string" ? body.effort.trim() : "";
   const annotationIds = operationAnnotationIds(body.annotationIds);
+  const recovery = teacherRecoveryRequest(body);
   return {
     operationId: id,
-    requestHash: requestHash([action, courseId, chapterId, lesson, provider, model, effort, annotationIds]),
+    requestHash: requestHash([action, courseId, chapterId, lesson, provider, model, effort, annotationIds, recovery.handoffId, recovery.resumeSessionId]),
     annotationIds,
+    ...recovery,
   };
 }
 
@@ -187,19 +210,22 @@ function reserveTeacherTask(request, response, details) {
     child: null,
     cancelled: false,
     cancelReason: "",
+    interruptionKind: "",
     responseEnding: false,
     released: false,
     markerOwned: false,
+    markerWrite: Promise.resolve(),
     stopPromise: null,
     startedAt: new Date().toISOString(),
     cancelledPromise: new Promise((resolve) => { resolveCancelled = resolve; }),
     settled: new Promise((resolve) => { resolveSettled = resolve; }),
   };
 
-  const cancel = (reason = "Teacher action was cancelled.") => {
+  const cancel = (reason = "Teacher action was cancelled.", interruptionKind = "cancelled") => {
     if (task.cancellable === false || task.cancelled || task.released) return false;
     task.cancelled = true;
     task.cancelReason = reason;
+    task.interruptionKind = interruptionKind;
     resolveCancelled();
     void quiesceTaskProcessGroup(task);
     return true;
@@ -209,6 +235,19 @@ function reserveTeacherTask(request, response, details) {
     task.child = child;
     if (task.cancelled) void quiesceTaskProcessGroup(task);
   };
+  task.setSessionId = (sessionId) => {
+    if (!SESSION_ID.test(sessionId || "")) return;
+    task.sessionId = sessionId;
+    if (task.markerOwned && !task.released) {
+      task.markerWrite = task.markerWrite.catch(() => undefined).then(async () => {
+        if (!task.markerOwned || task.released) return;
+        await writeActiveTeacherMarker(task);
+      });
+      void task.markerWrite.catch((error) => {
+        console.error(`Could not update the active teacher marker: ${error.message}`);
+      });
+    }
+  };
   task.throwIfCancelled = (message = "Teacher action was cancelled.") => {
     if (task.cancelled) throw new Error(task.cancelReason || message);
   };
@@ -216,6 +255,7 @@ function reserveTeacherTask(request, response, details) {
     if (task.released) return;
     task.released = true;
     if (task.markerOwned) {
+      await task.markerWrite.catch(() => undefined);
       await clearActiveTeacherMarker().catch((error) => {
         console.error(`Could not clear the active teacher marker: ${error.message}`);
       });
@@ -255,20 +295,40 @@ async function claimOperationTask(request, response, details) {
   }
 }
 
-async function waitForTeacherProcess(child, task, { terminateProcessGroup = true } = {}) {
+async function waitForTeacherProcess(child, task, {
+  terminateProcessGroup = true,
+  stallMilliseconds = 0,
+  lastActivity = () => Date.now(),
+} = {}) {
   let settleProcess;
   const processResult = new Promise((resolve) => { settleProcess = resolve; });
   child.once("error", (error) => settleProcess({ error }));
   child.once("close", (code, signal) => settleProcess({ code, signal }));
   if (terminateProcessGroup) child.once("exit", () => { void quiesceTaskProcessGroup(task); });
 
+  let stallTimer;
+  const stallResult = stallMilliseconds > 0
+    ? new Promise((resolve) => {
+      const check = () => {
+        const remaining = stallMilliseconds - (Date.now() - lastActivity());
+        if (remaining <= 0) {
+          resolve({ stalled: true });
+          return;
+        }
+        stallTimer = setTimeout(check, Math.min(remaining, 1000));
+      };
+      check();
+    })
+    : new Promise(() => {});
   const result = await Promise.race([
     processResult,
     task.cancelledPromise.then(async () => {
       if (terminateProcessGroup) await quiesceTaskProcessGroup(task);
       return { cancelled: true };
     }),
+    stallResult,
   ]);
+  clearTimeout(stallTimer);
   if (terminateProcessGroup) await quiesceTaskProcessGroup(task);
   return result;
 }
@@ -389,6 +449,7 @@ function activeTeacherDetails(task) {
     courseId: task.courseId || "",
     chapterId: task.chapterId || "",
     lesson: task.lesson || "",
+    sessionId: task.sessionId || "",
     startedAt: task.startedAt,
     notice: task.guardNotice || "",
   };
@@ -1150,7 +1211,94 @@ function streamOperationComplete(response, event) {
     "X-Accel-Buffering": "no",
   });
   writeStreamEvent(response, event);
-  if (!response.destroyed && !response.writableEnded) response.end();
+}
+
+function streamOperationFailure(response, task, handoff) {
+  response.writeHead(200, {
+    "Content-Type": "application/x-ndjson; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  writeStreamEvent(response, {
+    type: "error",
+    text: handoff.message,
+    interruption: interruptionPayload(task, handoff, handoff),
+  });
+}
+
+async function failedOperationReplay(operation, expected) {
+  const handoff = await readTeacherHandoff(WORKSPACE_ROOT, operation.operationId);
+  if (!handoff) return null;
+  if (handoff.requestHash !== operation.requestHash
+    || handoff.action !== expected.action
+    || handoff.courseId !== (expected.courseId || "")
+    || handoff.chapterId !== (expected.chapterId || "")
+    || handoff.lesson !== (expected.lesson || "")) {
+    throw operationConflict("This teacher operation id belongs to a different failed request");
+  }
+  return handoff;
+}
+
+async function requestedTeacherHandoff(operation, expected) {
+  if (!operation.handoffId) return null;
+  const handoff = await readTeacherHandoff(WORKSPACE_ROOT, operation.handoffId);
+  if (!handoff) throw new Error("The selected teacher checkpoint no longer exists");
+  if (handoff.action !== expected.action
+    || handoff.courseId !== (expected.courseId || "")
+    || handoff.chapterId !== (expected.chapterId || "")
+    || handoff.lesson !== (expected.lesson || "")) {
+    throw operationConflict("This teacher checkpoint belongs to a different task");
+  }
+  if (expected.action === "create"
+    && (handoff.title !== expected.title || handoff.initialRequest !== expected.initialRequest)) {
+    throw operationConflict("This teacher checkpoint belongs to a different course request");
+  }
+  if (operation.resumeSessionId
+    && (handoff.provider !== expected.provider || handoff.sessionId !== operation.resumeSessionId)) {
+    throw operationConflict("This teacher session cannot resume the selected checkpoint");
+  }
+  return handoff;
+}
+
+function interruptionPayload(task, failure, handoff = null) {
+  return {
+    kind: failure.kind,
+    provider: task.provider,
+    sessionId: handoff ? handoff.sessionId : task.sessionId || "",
+    message: failure.message,
+    handoffId: handoff?.id || "",
+    hasPartialWork: Boolean(handoff?.hasPartialWork),
+  };
+}
+
+function handoffForClient(handoff) {
+  if (!handoff) return null;
+  const {
+    root: _root,
+    partialRoot: _partialRoot,
+    partialRoots: _partialRoots,
+    requestHash: _requestHash,
+    ...value
+  } = handoff;
+  return value;
+}
+
+async function operationFailure(id, courseId = "") {
+  const handoff = await readTeacherHandoff(WORKSPACE_ROOT, id);
+  if (!handoff || (courseId && handoff.courseId !== courseId)) return null;
+  return {
+    status: "failed",
+    failure: {
+      kind: handoff.kind,
+      provider: handoff.provider,
+      sessionId: handoff.sessionId,
+      message: handoff.message,
+      handoffId: handoff.id,
+      hasPartialWork: handoff.hasPartialWork,
+    },
+    handoff: handoffForClient(handoff),
+  };
 }
 
 async function operationStatus(id, courseId = "") {
@@ -1178,9 +1326,8 @@ async function operationStatus(id, courseId = "") {
     await recoverCourseCreationArtifacts(WORKSPACE_ROOT, { operationId: id, archiveIncomplete: false });
     found = await findWorkspaceOperation(id);
   }
-  return found
-    ? { status: "complete", event: operationCompleteEvent(found) }
-    : { status: "unknown" };
+  if (found) return { status: "complete", event: operationCompleteEvent(found) };
+  return await operationFailure(id, courseId) || { status: "unknown" };
 }
 
 export function providerUpdateCompletionText(provider, beforeVersion, afterVersion) {
@@ -1259,8 +1406,8 @@ async function runProviderUpdate(request, response, provider, {
       throwAfterCleanup = error;
     }
   } finally {
-    task.endResponse();
     await task.release();
+    task.endResponse();
   }
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
@@ -1268,14 +1415,21 @@ async function runProviderUpdate(request, response, provider, {
 async function runCourseCreation(request, response, body, {
   providerLookup = providerInfo,
   spawnProcess = spawn,
+  teacherStallMilliseconds = TEACHER_STALL_TIMEOUT_MS,
 } = {}) {
   const provider = body.provider === "claude" || body.provider === "codex" ? body.provider : "";
   if (!provider) throw new Error("Choose Claude Code or Codex");
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  const initialRequest = typeof body.initialRequest === "string"
+    ? body.initialRequest.trim()
+    : typeof body.goal === "string" ? body.goal.trim() : "";
   const operation = createOperationRequest(body, provider, operationId(body.operationId));
+  const initialSessionId = operation.resumeSessionId || (provider === "claude" ? randomUUID() : "");
   const task = await claimOperationTask(request, response, {
     provider,
     action: "create",
     courseId: "",
+    sessionId: initialSessionId,
     ...operation,
   });
   if (!task) return;
@@ -1284,6 +1438,11 @@ async function runCourseCreation(request, response, body, {
   let promoted = null;
   let draftComplete = false;
   let otherCourseGuard = null;
+  let handoff = null;
+  let lastDiagnostic = "";
+  let lastProviderError = "";
+  let providerOutcome = null;
+  let providerStarted = false;
   let throwAfterCleanup = null;
   try {
     const replay = assertOperationReplay(
@@ -1298,6 +1457,27 @@ async function runCourseCreation(request, response, body, {
       streamOperationComplete(response, replay);
       return;
     }
+    const failedReplay = await failedOperationReplay(operation, {
+      action: "create",
+      courseId: "",
+      chapterId: "",
+      lesson: "",
+    });
+    if (failedReplay) {
+      task.cancellable = false;
+      task.responseEnding = true;
+      streamOperationFailure(response, task, failedReplay);
+      return;
+    }
+    handoff = await requestedTeacherHandoff(operation, {
+      action: "create",
+      provider,
+      courseId: "",
+      chapterId: "",
+      lesson: "",
+      title,
+      initialRequest,
+    });
     const installed = await providerLookup(provider);
     if (!installed.available) throw new Error(`${providerName(provider)} is not available on PATH`);
     if (!installed.compatible || !installed.authenticated) throw new Error(installed.error || "The selected teacher is not ready");
@@ -1318,7 +1498,7 @@ async function runCourseCreation(request, response, body, {
     if (!chapter || chapter.lectures.length) throw new Error("The course draft must begin with an empty Foundations chapter");
     const manifestSnapshot = structure.manifestText;
     const learnerStateSnapshot = await snapshotAppOwnedLearnerState(draft.root);
-    const prompt = buildTeacherPrompt({
+    const prompt = `${buildTeacherPrompt({
       action: "first",
       workspaceRoot: WORKSPACE_ROOT,
       courseRoot: draft.root,
@@ -1326,8 +1506,13 @@ async function runCourseCreation(request, response, body, {
       annotations: [],
       teachSkillPath: TEACH_SKILL_PATH,
       initialRequest: draft.initialRequest,
+    })}${teacherHandoffPrompt(handoff)}`;
+    const spec = providerCommand(provider, draft.root, WORKSPACE_ROOT, {
+      ...providerOptions,
+      ...(operation.resumeSessionId
+        ? { resumeSessionId: operation.resumeSessionId }
+        : provider === "claude" ? { sessionId: task.sessionId } : {}),
     });
-    const spec = providerCommand(provider, draft.root, WORKSPACE_ROOT, providerOptions);
     task.throwIfCancelled("Course creation was cancelled.");
 
     response.writeHead(200, {
@@ -1353,36 +1538,49 @@ async function runCourseCreation(request, response, body, {
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
+    providerStarted = true;
     task.setChild(child);
     let lastMessage = "";
-    let lastDiagnostic = "";
     let terminalState = "pending";
+    let lastActivityAt = Date.now();
 
     attachLineParser(child.stdout, (line) => {
+      lastActivityAt = Date.now();
       const event = parseProviderLine(provider, line);
       if (!event) return;
+      if (event.sessionId) task.setSessionId(event.sessionId);
       if (event.terminal) terminalState = event.terminal;
       if (event.kind === "summary" || event.kind === "message") lastMessage = event.text;
+      if (event.kind === "error") {
+        lastProviderError = event.text;
+        return;
+      }
       if (event.kind === "terminal") return;
       writeStreamEvent(response, { type: event.kind, text: event.text });
     });
     attachLineParser(child.stderr, (line) => {
+      lastActivityAt = Date.now();
       const text = line.trim();
       if (text && !text.startsWith("WARNING: proceeding")) lastDiagnostic = boundedEventText(text, 1000);
     });
     let inputError = null;
     child.stdin.once("error", (error) => { inputError = error; });
     child.stdin.end(prompt);
-    const outcome = await waitForTeacherProcess(child, task);
+    providerOutcome = await waitForTeacherProcess(child, task, {
+      stallMilliseconds: teacherStallMilliseconds,
+      lastActivity: () => lastActivityAt,
+    });
     task.throwIfCancelled("Course creation was cancelled.");
-    if (outcome.error) throw new Error(`Could not start the teacher: ${outcome.error.message}`);
-    if (outcome.code !== 0) {
-      const failure = outcome.signal ? "Course creation was cancelled." : `${providerName(provider)} exited with code ${outcome.code}.`;
-      throw new Error(lastDiagnostic ? `${failure} ${lastDiagnostic}` : failure);
+    if (providerOutcome.stalled) throw new Error(`${providerName(provider)} stopped producing activity`);
+    if (providerOutcome.error) throw new Error(`Could not start the teacher: ${providerOutcome.error.message}`);
+    if (providerOutcome.code !== 0) {
+      const failure = providerOutcome.signal ? "Course creation was cancelled." : `${providerName(provider)} exited with code ${providerOutcome.code}.`;
+      const detail = lastProviderError || lastDiagnostic;
+      throw new Error(detail ? `${failure} ${detail}` : failure);
     }
     if (inputError) throw new Error(`The teacher did not accept its input: ${inputError.message}`);
     if (terminalState !== "success") {
-      throw new Error(`${providerName(provider)} ended without confirming a successful turn`);
+      throw new Error(lastProviderError || `${providerName(provider)} ended without confirming a successful turn`);
     }
     const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
     otherCourseGuard = null;
@@ -1428,6 +1626,14 @@ async function runCourseCreation(request, response, body, {
     promoted = await promoteCourseWorkspace(WORKSPACE_ROOT, draft.root, draft.id);
     course.id = promoted.id;
     task.courseId = promoted.id;
+    if (handoff) {
+      try {
+        await discardTeacherHandoff(WORKSPACE_ROOT, handoff.id);
+        handoff = null;
+      } catch (handoffError) {
+        writeStreamEvent(response, { type: "status", text: `The completed checkpoint could not be cleared: ${handoffError.message}` });
+      }
+    }
     task.responseEnding = true;
     task.completeEvent = {
       type: "complete",
@@ -1439,7 +1645,16 @@ async function runCourseCreation(request, response, body, {
     };
     writeStreamEvent(response, task.completeEvent);
   } catch (error) {
-    let text = error.message;
+    const failure = classifyTeacherInterruption({
+      provider,
+      message: lastProviderError || error.message,
+      diagnostic: lastDiagnostic,
+      code: providerOutcome?.code,
+      signal: providerOutcome?.signal,
+      stalled: Boolean(providerOutcome?.stalled),
+      requested: task.interruptionKind,
+    });
+    let text = failure.message;
     if (otherCourseGuard) {
       try {
         const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
@@ -1450,25 +1665,74 @@ async function runCourseCreation(request, response, body, {
         text += ` Other-course cleanup also failed: ${guardError.message}`;
       }
     }
+    let checkpoint = null;
     if (!promoted && !draftComplete && draft && draftIdentity) {
       try {
         await assertCourseIdentity(draft.root, draftIdentity);
         if (path.dirname(draft.root) !== WORKSPACE_ROOT || !path.basename(draft.root).startsWith(".margin-course-draft-")) {
           throw new Error("Invalid hidden course draft cleanup path");
         }
-        await rm(draft.root, { recursive: true, force: false });
+        if ((providerStarted || failure.kind === "paused") && task.interruptionKind !== "cancel") {
+          checkpoint = await createTeacherHandoff(WORKSPACE_ROOT, {
+            operationId: operation.operationId,
+            action: "create",
+            provider,
+            kind: failure.kind,
+            sessionId: providerStarted ? task.sessionId || "" : "",
+            requestHash: operation.requestHash,
+            courseId: "",
+            chapterId: "",
+            lesson: "",
+            title,
+            initialRequest,
+            message: failure.message,
+          }, {
+            partialCourseRoot: draft.root,
+            previousHandoffId: handoff?.id || "",
+          });
+          draft = null;
+          if (handoff && handoff.id !== checkpoint.id) {
+            await discardTeacherHandoff(WORKSPACE_ROOT, handoff.id);
+            handoff = null;
+          }
+        } else {
+          await rm(draft.root, { recursive: true, force: false });
+          draft = null;
+        }
       } catch (cleanupError) {
         text += ` Unfinished course cleanup also failed: ${cleanupError.message}`;
       }
     }
+    if (!checkpoint && failure.kind === "paused" && !draft) {
+      try {
+        checkpoint = await createTeacherHandoff(WORKSPACE_ROOT, {
+          operationId: operation.operationId,
+          action: "create",
+          provider,
+          kind: failure.kind,
+          sessionId: providerStarted ? task.sessionId || "" : "",
+          requestHash: operation.requestHash,
+          courseId: "",
+          chapterId: "",
+          lesson: "",
+          title,
+          initialRequest,
+          message: failure.message,
+        }, { previousHandoffId: handoff?.id || "" });
+      } catch (checkpointError) {
+        text += ` Checkpoint creation also failed: ${checkpointError.message}`;
+      }
+    }
     if (response.headersSent) {
-      if (!response.destroyed) writeStreamEvent(response, { type: "error", text });
+      if (!response.destroyed) {
+        writeStreamEvent(response, { type: "error", text, interruption: interruptionPayload(task, failure, checkpoint) });
+      }
     } else {
       throwAfterCleanup = Object.assign(new Error(text, { cause: error }), Number.isInteger(error.status) ? { status: error.status } : {});
     }
   } finally {
-    task.endResponse();
     await task.release();
+    task.endResponse();
   }
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
@@ -1476,6 +1740,7 @@ async function runCourseCreation(request, response, body, {
 async function runTeacher(request, response, body, {
   providerLookup = providerInfo,
   spawnProcess = spawn,
+  teacherStallMilliseconds = TEACHER_STALL_TIMEOUT_MS,
 } = {}) {
   const courseId = assertCourseId(body.course);
   const action = body.action === "revise" || body.action === "next" ? body.action : "";
@@ -1494,11 +1759,13 @@ async function runTeacher(request, response, body, {
     lesson,
     operationId(body.operationId),
   );
+  const initialSessionId = operation.resumeSessionId || (provider === "claude" ? randomUUID() : "");
   const task = await claimOperationTask(request, response, {
     provider,
     action,
     courseId,
     chapterId,
+    sessionId: initialSessionId,
     ...operation,
   });
   if (!task) return;
@@ -1511,22 +1778,55 @@ async function runTeacher(request, response, body, {
   let learnerStateSnapshot = null;
   let courseTransaction = null;
   let otherCourseGuard = null;
+  let handoff = null;
+  let lastDiagnostic = "";
+  let lastProviderError = "";
+  let providerOutcome = null;
+  let providerStarted = false;
 
-  const rollback = async () => {
+  const rollback = async (failure = null) => {
+    let partialCourseRoot = "";
     if (courseTransaction) {
       const transaction = courseTransaction;
       courseTransaction = null;
-      await rollbackCourseTransaction(transaction);
-      return;
+      let changed = true;
+      try {
+        changed = !(await courseTransactionMatchesSnapshot(transaction));
+      } catch {
+        // Unsafe or unreadable partial output is still worth preserving for a
+        // later teacher to inspect without exposing it as the live course.
+      }
+      const result = await rollbackCourseTransaction(transaction);
+      if (result.archived) {
+        const archived = path.join(WORKSPACE_ROOT, result.archived);
+        if (changed && failure) partialCourseRoot = archived;
+        else await rm(archived, { recursive: true, force: true });
+      }
+    } else if (courseRoot && courseIdentity) {
+      await rollbackTeacherMutation({
+        courseRoot,
+        courseIdentity,
+        lessonSnapshot,
+        manifestSnapshot,
+        learnerStateSnapshot,
+        lectureHistorySnapshot,
+      });
     }
-    if (!courseRoot || !courseIdentity) return;
-    await rollbackTeacherMutation({
-      courseRoot,
-      courseIdentity,
-      lessonSnapshot,
-      manifestSnapshot,
-      learnerStateSnapshot,
-      lectureHistorySnapshot,
+    if (!failure || task.interruptionKind === "cancel" || (!providerStarted && failure.kind !== "paused")) return null;
+    return createTeacherHandoff(WORKSPACE_ROOT, {
+      operationId: operation.operationId,
+      action,
+      provider,
+      kind: failure.kind,
+      sessionId: providerStarted ? task.sessionId || "" : "",
+      requestHash: operation.requestHash,
+      courseId,
+      chapterId,
+      lesson,
+      message: failure.message,
+    }, {
+      partialCourseRoot,
+      previousHandoffId: handoff?.id || "",
     });
   };
   let throwAfterCleanup = null;
@@ -1545,6 +1845,14 @@ async function runTeacher(request, response, body, {
       streamOperationComplete(response, replay);
       return;
     }
+    const failedReplay = await failedOperationReplay(operation, { action, courseId, chapterId, lesson });
+    if (failedReplay) {
+      task.cancellable = false;
+      task.responseEnding = true;
+      streamOperationFailure(response, task, failedReplay);
+      return;
+    }
+    handoff = await requestedTeacherHandoff(operation, { action, provider, courseId, chapterId, lesson });
     const installed = await providerLookup(provider);
     if (!installed.available) throw new Error(`${provider === "claude" ? "Claude Code" : "Codex"} is not available on PATH`);
     if (!installed.compatible || !installed.authenticated) throw new Error(installed.error || "The selected teacher is not ready");
@@ -1587,10 +1895,10 @@ async function runTeacher(request, response, body, {
     task.otherCourseGuard = otherCourseGuard;
     task.guardNotice = otherCourseGuardNotice(otherCourseGuard);
     if (task.guardNotice) console.error(task.guardNotice);
-    courseTransaction = await beginCourseTransaction(WORKSPACE_ROOT, courseId, courseRoot);
+    courseTransaction = await beginCourseTransaction(WORKSPACE_ROOT, courseId, courseRoot, { preserveDisplaced: true });
     task.throwIfCancelled("Teacher action was cancelled before it started");
 
-    const prompt = buildTeacherPrompt({
+    const prompt = `${buildTeacherPrompt({
       action,
       workspaceRoot: WORKSPACE_ROOT,
       courseRoot,
@@ -1598,8 +1906,13 @@ async function runTeacher(request, response, body, {
       chapter,
       annotations,
       teachSkillPath: TEACH_SKILL_PATH,
+    })}${teacherHandoffPrompt(handoff)}`;
+    const spec = providerCommand(provider, courseRoot, WORKSPACE_ROOT, {
+      ...providerOptions,
+      ...(operation.resumeSessionId
+        ? { resumeSessionId: operation.resumeSessionId }
+        : provider === "claude" ? { sessionId: task.sessionId } : {}),
     });
-    const spec = providerCommand(provider, courseRoot, WORKSPACE_ROOT, providerOptions);
     task.throwIfCancelled("Teacher action was cancelled.");
 
     response.writeHead(200, {
@@ -1626,21 +1939,29 @@ async function runTeacher(request, response, body, {
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
+    providerStarted = true;
     task.setChild(child);
     let lastMessage = "";
-    let lastDiagnostic = "";
     let terminalState = "pending";
+    let lastActivityAt = Date.now();
 
     const handleStdoutLine = (line) => {
+      lastActivityAt = Date.now();
       const event = parseProviderLine(provider, line);
       if (!event) return;
+      if (event.sessionId) task.setSessionId(event.sessionId);
       if (event.terminal) terminalState = event.terminal;
       if (event.kind === "summary" || event.kind === "message") lastMessage = event.text;
+      if (event.kind === "error") {
+        lastProviderError = event.text;
+        return;
+      }
       if (event.kind === "terminal") return;
       writeStreamEvent(response, { type: event.kind, text: event.text });
     };
     attachLineParser(child.stdout, handleStdoutLine);
     attachLineParser(child.stderr, (line) => {
+      lastActivityAt = Date.now();
       const text = line.trim();
       if (text && !text.startsWith("WARNING: proceeding")) {
         lastDiagnostic = boundedEventText(text, 1000);
@@ -1649,16 +1970,21 @@ async function runTeacher(request, response, body, {
     let inputError = null;
     child.stdin.once("error", (error) => { inputError = error; });
     child.stdin.end(prompt);
-    const outcome = await waitForTeacherProcess(child, task);
+    providerOutcome = await waitForTeacherProcess(child, task, {
+      stallMilliseconds: teacherStallMilliseconds,
+      lastActivity: () => lastActivityAt,
+    });
     task.throwIfCancelled("Teacher action was cancelled.");
-    if (outcome.error) throw new Error(`Could not start the teacher: ${outcome.error.message}`);
-    if (outcome.code !== 0) {
-      const failure = outcome.signal ? "Teacher action was cancelled." : `${providerName(provider)} exited with code ${outcome.code}.`;
-      throw new Error(lastDiagnostic ? `${failure} ${lastDiagnostic}` : failure);
+    if (providerOutcome.stalled) throw new Error(`${providerName(provider)} stopped producing activity`);
+    if (providerOutcome.error) throw new Error(`Could not start the teacher: ${providerOutcome.error.message}`);
+    if (providerOutcome.code !== 0) {
+      const failure = providerOutcome.signal ? "Teacher action was cancelled." : `${providerName(provider)} exited with code ${providerOutcome.code}.`;
+      const detail = lastProviderError || lastDiagnostic;
+      throw new Error(detail ? `${failure} ${detail}` : failure);
     }
     if (inputError) throw new Error(`The teacher did not accept its input: ${inputError.message}`);
     if (terminalState !== "success") {
-      throw new Error(`${providerName(provider)} ended without confirming a successful turn`);
+      throw new Error(lastProviderError || `${providerName(provider)} ended without confirming a successful turn`);
     }
     const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
     otherCourseGuard = null;
@@ -1716,6 +2042,14 @@ async function runTeacher(request, response, body, {
     courseTransaction = null;
     lectureHistorySnapshot = null;
     learnerStateSnapshot = null;
+    if (handoff) {
+      try {
+        await discardTeacherHandoff(WORKSPACE_ROOT, handoff.id);
+        handoff = null;
+      } catch (handoffError) {
+        writeStreamEvent(response, { type: "status", text: `The completed checkpoint could not be cleared: ${handoffError.message}` });
+      }
+    }
     task.responseEnding = true;
     task.completeEvent = {
       type: "complete",
@@ -1729,7 +2063,16 @@ async function runTeacher(request, response, body, {
     };
     writeStreamEvent(response, task.completeEvent);
   } catch (error) {
-    let text = error.message;
+    const failure = classifyTeacherInterruption({
+      provider,
+      message: lastProviderError || error.message,
+      diagnostic: lastDiagnostic,
+      code: providerOutcome?.code,
+      signal: providerOutcome?.signal,
+      stalled: Boolean(providerOutcome?.stalled),
+      requested: task.interruptionKind,
+    });
+    let text = failure.message;
     if (otherCourseGuard) {
       try {
         const guardResult = await mutateAnnotations(() => closeOtherCourseGuard(otherCourseGuard));
@@ -1740,19 +2083,26 @@ async function runTeacher(request, response, body, {
         text += ` Other-course cleanup also failed: ${guardError.message}`;
       }
     }
+    let checkpoint = null;
     try {
-      await rollback();
+      checkpoint = await rollback(failure);
+      if (checkpoint && handoff && handoff.id !== checkpoint.id) {
+        await discardTeacherHandoff(WORKSPACE_ROOT, handoff.id);
+        handoff = null;
+      }
     } catch (rollbackError) {
       text += ` Course cleanup also failed: ${rollbackError.message}`;
     }
     if (response.headersSent) {
-      if (!response.destroyed) writeStreamEvent(response, { type: "error", text });
+      if (!response.destroyed) {
+        writeStreamEvent(response, { type: "error", text, interruption: interruptionPayload(task, failure, checkpoint) });
+      }
     } else {
       throwAfterCleanup = Object.assign(new Error(text, { cause: error }), Number.isInteger(error.status) ? { status: error.status } : {});
     }
   } finally {
-    task.endResponse();
     await task.release();
+    task.endResponse();
   }
   if (throwAfterCleanup) throw throwAfterCleanup;
 }
@@ -1771,6 +2121,7 @@ async function handleRequest(request, response, {
   contentOrigin = "",
   providerLookup = providerInfo,
   spawnProcess = spawn,
+  teacherStallMilliseconds = TEACHER_STALL_TIMEOUT_MS,
 } = {}) {
   const url = new URL(request.url, `http://${request.headers.host || `${HOST}:${PORT}`}`);
   const pathname = decodeURIComponent(url.pathname);
@@ -1794,16 +2145,37 @@ async function handleRequest(request, response, {
       sendJson(response, 200, await operationStatus(operationId(operationMatch[1]), url.searchParams.get("course") || ""));
       return;
     }
+    const handoffMatch = pathname.match(/^\/api\/teacher-handoffs\/([^/]+)$/);
+    if (handoffMatch && request.method === "GET") {
+      const handoff = await readTeacherHandoff(WORKSPACE_ROOT, operationId(handoffMatch[1]));
+      sendJson(response, handoff ? 200 : 404, handoff ? { handoff: handoffForClient(handoff) } : { error: "Teacher checkpoint not found" });
+      return;
+    }
+    if (handoffMatch && request.method === "DELETE") {
+      const id = operationId(handoffMatch[1]);
+      if (activeTask?.handoffId === id) {
+        sendJson(response, 409, { error: "This teacher checkpoint is being used by the current task." });
+        return;
+      }
+      const removed = await discardTeacherHandoff(WORKSPACE_ROOT, id);
+      sendJson(response, removed ? 200 : 404, removed ? { ok: true } : { error: "Teacher checkpoint not found" });
+      return;
+    }
     const operationCancelMatch = request.method === "POST" && pathname.match(/^\/api\/operations\/([^/]+)\/cancel$/);
     if (operationCancelMatch) {
       const id = operationId(operationCancelMatch[1]);
+      const body = await readJson(request);
+      const mode = body.mode === "pause" ? "pause" : "cancel";
       if (activeTask?.operationId === id) {
         if (activeTask.completeEvent) {
           sendJson(response, 200, { status: "complete", event: activeTask.completeEvent });
           return;
         }
-        const cancelled = activeTask.cancel?.("Teacher action was cancelled by the learner.") || false;
-        sendJson(response, 202, { ok: cancelled, status: cancelled ? "cancelling" : "finishing" });
+        const cancelled = activeTask.cancel?.(
+          mode === "pause" ? "Teacher action was paused by the learner." : "Teacher action was cancelled by the learner.",
+          mode,
+        ) || false;
+        sendJson(response, 202, { ok: cancelled, status: cancelled ? mode === "pause" ? "pausing" : "cancelling" : "finishing" });
         return;
       }
       const status = await operationStatus(id, url.searchParams.get("course") || "");
@@ -1836,7 +2208,7 @@ async function handleRequest(request, response, {
   }
 
   if (request.method === "POST" && pathname === "/api/courses/create") {
-    await runCourseCreation(request, response, await readJson(request), { providerLookup, spawnProcess });
+    await runCourseCreation(request, response, await readJson(request), { providerLookup, spawnProcess, teacherStallMilliseconds });
     return;
   }
 
@@ -2005,7 +2377,7 @@ async function handleRequest(request, response, {
   }
 
   if (pathname === "/api/teacher" && request.method === "POST") {
-    await runTeacher(request, response, await readJson(request), { providerLookup, spawnProcess });
+    await runTeacher(request, response, await readJson(request), { providerLookup, spawnProcess, teacherStallMilliseconds });
     return;
   }
 
@@ -2023,9 +2395,10 @@ export function createAppServer({
   contentOrigin = "",
   providerLookup = providerInfo,
   spawnProcess = spawn,
+  teacherStallMilliseconds = TEACHER_STALL_TIMEOUT_MS,
 } = {}) {
   const server = createServer((request, response) => {
-    handleRequest(request, response, { sessionToken, contentOrigin, providerLookup, spawnProcess }).catch((error) => {
+    handleRequest(request, response, { sessionToken, contentOrigin, providerLookup, spawnProcess, teacherStallMilliseconds }).catch((error) => {
       if (response.headersSent) {
         writeStreamEvent(response, { type: "error", text: error.message });
         response.end();
