@@ -26,6 +26,19 @@ function persistPreference(key, value) {
   return preferenceWrite;
 }
 
+const COVER_STYLES = ["plain", "dye", "mosaic", "wood", "marble", "diffusion"];
+const COVER_LABELS = { plain: "Plain", dye: "Tie-dye", mosaic: "Mosaic", wood: "Wood", marble: "Marble", diffusion: "Diffusion" };
+
+function storedCourseCovers() {
+  try {
+    const parsed = JSON.parse(String(preference("margin:covers", "{}") || "{}"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([, style]) => COVER_STYLES.includes(style)));
+  } catch {
+    return {};
+  }
+}
+
 const state = {
   courses: [],
   diagnostics: [],
@@ -37,6 +50,8 @@ const state = {
   pendingSelection: null,
   pendingImage: null,
   view: "library",
+  courseCovers: storedCourseCovers(),
+  openCoverMenu: null,
   expandedChapterId: null,
   teacherMenuOpen: false,
   selectedTeacher: preference("margin:teacher", "claude"),
@@ -74,13 +89,13 @@ const state = {
 };
 
 const elements = Object.fromEntries([
-  "app", "library-view", "library-task-host", "course-shelf", "new-course-dialog", "new-course-form", "new-course-name",
+  "app", "brand-home", "library-view", "library-task-host", "course-shelf", "new-course-dialog", "new-course-form", "new-course-name",
   "new-course-request", "new-course-teacher-slip", "new-course-teacher-select", "new-course-model-select",
   "new-course-effort-select", "new-course-teacher-status", "new-course-config-hint", "new-course-progress",
   "new-course-progress-title", "new-course-progress-activity", "cancel-new-course", "create-new-course",
   "delete-dialog", "delete-form", "delete-title", "delete-detail", "delete-recovery", "delete-error",
   "cancel-delete", "confirm-delete",
-  "back-to-library", "current-course-title", "chapter-list",
+  "current-course-title", "chapter-list",
   "reference-list", "course-panel-content", "margin-panel-content", "left-panel-resizer", "right-panel-resizer",
   "toggle-left-panel", "toggle-right-panel", "decrease-font-size", "reset-font-size",
   "increase-font-size", "font-size-value", "lesson-frame", "selection-popover",
@@ -674,19 +689,63 @@ function renderNewCourseTeacherFields(selectedProvider) {
   renderNewCourseFormState();
 }
 
+function courseCover(courseId) {
+  const style = state.courseCovers[courseId];
+  return COVER_STYLES.includes(style) ? style : "plain";
+}
+
+function coverMenuHtml(course, toneClass) {
+  const current = courseCover(course.id);
+  return `
+    <div class="cover-menu ${toneClass}" role="group" aria-label="Cover for ${escapeHtml(course.title)}">
+      ${COVER_STYLES.map((style) => `
+        <button class="cover-option" type="button" data-set-cover="${style}" aria-pressed="${style === current}">
+          <span class="cover-swatch"><span class="cover-swatch-zoom${style === "plain" ? "" : ` cover-${style}`}" aria-hidden="true"></span></span>
+          <span class="cover-option-label">${COVER_LABELS[style]}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function setCourseCover(style) {
+  const courseId = state.openCoverMenu;
+  if (!courseId || !COVER_STYLES.includes(style)) return;
+  if (style === "plain") delete state.courseCovers[courseId];
+  else state.courseCovers[courseId] = style;
+  const known = new Set(state.courses.map((course) => course.id));
+  state.courseCovers = Object.fromEntries(Object.entries(state.courseCovers).filter(([id]) => known.has(id)));
+  persistPreference("margin:covers", JSON.stringify(state.courseCovers));
+  renderLibrary();
+  elements.courseShelf.querySelector(`[data-set-cover="${style}"]`)?.focus({ preventScroll: true });
+}
+
+function closeCoverMenu() {
+  if (!state.openCoverMenu) return;
+  state.openCoverMenu = null;
+  renderLibrary();
+}
+
 function renderLibrary() {
   const courseCards = state.courses.map((course, index) => {
     const lectures = allLectures(course).length;
+    const toneClass = `course-tone-${index % 8}`;
+    const cover = courseCover(course.id);
+    const menuOpen = state.openCoverMenu === course.id;
     return `
       <div class="course-card-shell">
-        <button class="course-card course-tone-${index % 4}" type="button" data-course-id="${escapeHtml(course.id)}">
+        <button class="course-card ${toneClass}${cover === "plain" ? "" : ` cover-${cover}`}" type="button" data-course-id="${escapeHtml(course.id)}">
           <span class="course-spine" aria-hidden="true"></span>
           <strong>${escapeHtml(course.title)}</strong>
           <small>${course.chapters.length} ${course.chapters.length === 1 ? "chapter" : "chapters"} · ${lectures} ${lectures === 1 ? "lecture" : "lectures"}</small>
           <span class="course-open" aria-hidden="true">Open →</span>
         </button>
+        <button class="course-cover-trigger" type="button" data-cover-menu="${escapeHtml(course.id)}"
+          aria-haspopup="true" aria-expanded="${menuOpen}"
+          aria-label="Change cover for ${escapeHtml(course.title)}" title="Change cover">Cover</button>
         <button class="course-delete-trigger" type="button" data-delete-course="${escapeHtml(course.id)}"
           aria-label="Delete ${escapeHtml(course.title)}" title="Delete course">Delete</button>
+        ${menuOpen ? coverMenuHtml(course, toneClass) : ""}
       </div>
     `;
   }).join("");
@@ -715,6 +774,17 @@ function renderLibrary() {
   }
   for (const button of elements.courseShelf.querySelectorAll("[data-delete-course]")) {
     button.addEventListener("click", () => requestCourseDeletion(button.dataset.deleteCourse));
+  }
+  for (const button of elements.courseShelf.querySelectorAll("[data-cover-menu]")) {
+    button.addEventListener("click", () => {
+      const courseId = button.dataset.coverMenu;
+      state.openCoverMenu = state.openCoverMenu === courseId ? null : courseId;
+      renderLibrary();
+      elements.courseShelf.querySelector(`[data-cover-menu="${CSS.escape(courseId)}"]`)?.focus({ preventScroll: true });
+    });
+  }
+  for (const button of elements.courseShelf.querySelectorAll("[data-set-cover]")) {
+    button.addEventListener("click", () => setCourseCover(button.dataset.setCover));
   }
   elements.courseShelf.querySelector("[data-new-course]").addEventListener("click", openNewCourseDialog);
 }
@@ -1371,7 +1441,6 @@ function renderProviders() {
   elements.teacherEffortSelect.disabled = !selectedProvider?.available || updating;
   elements.teacherConfigHint.textContent = teacherConfigHint(selectedProvider);
   renderNewCourseTeacherFields(selectedProvider);
-  elements.backToLibrary.disabled = false;
   renderMessages();
   renderRunRecoveryActions();
 }
@@ -2485,6 +2554,7 @@ function applyPreferences(settings) {
   state.coursePanelWidth = Number(preference("margin:panel:course-width")) || null;
   state.marginPanelWidth = Number(preference("margin:panel:margin-width")) || null;
   state.workspaceScale = Math.min(1.4, Math.max(0.8, Number(preference("margin:workspace-scale")) || 1));
+  state.courseCovers = storedCourseCovers();
   renderPanelWidths();
   renderPanelState();
   renderWorkspaceScale();
@@ -2731,7 +2801,7 @@ async function init() {
   }
 }
 
-elements.backToLibrary.addEventListener("click", showLibrary);
+elements.brandHome.addEventListener("click", showLibrary);
 elements.newCourseForm.addEventListener("submit", createNewCourse);
 elements.cancelNewCourse.addEventListener("click", closeNewCourseDialog);
 elements.newCourseDialog.addEventListener("cancel", (event) => {
@@ -2827,6 +2897,7 @@ window.addEventListener("resize", () => {
 window.addEventListener("margin:toggle-course-panel", toggleCoursePanel);
 document.addEventListener("pointerdown", (event) => {
   if (!event.target.closest(".teacher-picker")) closeTeacherMenu();
+  if (!event.target.closest(".cover-menu, .course-cover-trigger")) closeCoverMenu();
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !elements.historyView.hidden) {
@@ -2835,6 +2906,10 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "Escape" && !elements.runDetailsView.hidden) {
     closeRunDetails();
+    return;
+  }
+  if (event.key === "Escape" && state.openCoverMenu) {
+    closeCoverMenu();
     return;
   }
   if (event.key === "Escape" && state.teacherMenuOpen) closeTeacherMenu({ restoreFocus: true });

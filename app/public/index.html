@@ -20,6 +20,20 @@
     </main>
   </section>
 
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute">
+    <defs>
+      <filter id="cover-dye-warp" x="-25%" y="-25%" width="150%" height="150%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="3" seed="7" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="28" xChannelSelector="R" yChannelSelector="G"/>
+        <feGaussianBlur stdDeviation="0.25"/>
+      </filter>
+      <filter id="cover-wood-warp" x="-25%" y="-25%" width="150%" height="150%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.006 0.028" numOctaves="2" seed="11" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="18" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+    </defs>
+  </svg>
+
   <dialog class="new-course-dialog" id="new-course-dialog" aria-labelledby="new-course-title"
     aria-describedby="new-course-intro">
     <form class="new-course-form" id="new-course-form" aria-busy="false">
@@ -102,12 +116,11 @@
   <div class="app-shell" id="app" data-ready="false" data-left-collapsed="false" data-right-collapsed="false" hidden>
     <aside class="course-rail" id="course-rail" aria-label="Course navigation">
       <div class="panel-scale-content" id="course-panel-content">
-        <header class="brand">
+        <button class="brand brand-home" id="brand-home" type="button" aria-label="Return to course library">
           <span class="brand-mark" aria-hidden="true">M</span>
           <strong>Margin</strong>
-        </header>
+        </button>
 
-        <button class="back-to-library" id="back-to-library" type="button">← All courses</button>
         <h2 class="current-course-title" id="current-course-title"></h2>
 
         <nav class="course-nav" aria-label="Chapters and lectures">

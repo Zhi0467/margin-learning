@@ -9,6 +9,10 @@
   --teal: #2f6f70;
   --mustard: #d7ae48;
   --coral: #bc5545;
+  --indigo: #3f4e79;
+  --plum: #7a4166;
+  --moss: #616b3d;
+  --slate: #54718c;
   --rose-paper: #f5e5df;
   --rule: #d8ccbb;
   --shadow: 0 18px 52px rgba(65, 46, 29, 0.14);
@@ -53,7 +57,7 @@ button:disabled { cursor: not-allowed; }
 
 /* Library */
 .library-view {
-  min-height: 100vh;
+  height: 100%;
   overflow: auto;
   background: var(--paper);
   opacity: 0;
@@ -120,6 +124,72 @@ button:disabled { cursor: not-allowed; }
   letter-spacing: -0.045em;
 }
 
+/* Per-course cover menu: opens from the card's hover "Cover" trigger. */
+.cover-menu {
+  --cover: var(--oxblood);
+  position: absolute;
+  z-index: 4;
+  top: 42px;
+  right: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 11px 13px;
+  padding: 13px 15px;
+  border: 1px solid #d4c5b3;
+  border-radius: 5px 12px 12px 5px;
+  background: var(--sheet);
+  box-shadow: 0 18px 44px rgba(43, 37, 31, 0.28);
+}
+
+.cover-option {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.cover-option-label {
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.cover-swatch {
+  position: relative;
+  display: block;
+  width: 34px;
+  height: 46px;
+  overflow: hidden;
+  border-radius: 2px 5px 5px 2px;
+  box-shadow: 0 4px 10px rgba(58, 39, 25, 0.24);
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.cover-option:hover .cover-swatch { transform: translateY(-2px); }
+
+.cover-option[aria-pressed="true"] .cover-swatch {
+  box-shadow: 0 0 0 2px var(--paper), 0 0 0 3.5px var(--walnut), 0 4px 10px rgba(58, 39, 25, 0.24);
+}
+
+.cover-option[aria-pressed="true"] .cover-option-label { color: var(--walnut); }
+
+.cover-swatch-zoom {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 300%;
+  height: 300%;
+  overflow: hidden;
+  background: var(--cover);
+  transform: scale(0.3334);
+  transform-origin: 0 0;
+}
+
+
 .course-shelf {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 236px));
@@ -179,7 +249,8 @@ button:disabled { cursor: not-allowed; }
   box-shadow: 0 23px 42px rgba(58, 39, 25, 0.24), inset -1px 0 rgba(255,255,255,0.16);
 }
 
-.course-delete-trigger {
+.course-delete-trigger,
+.course-cover-trigger {
   position: absolute;
   z-index: 3;
   top: 15px;
@@ -198,13 +269,150 @@ button:disabled { cursor: not-allowed; }
   transition: opacity 120ms ease, background 120ms ease;
 }
 
+.course-cover-trigger { right: 66px; }
+
 .course-card-shell:hover .course-delete-trigger,
-.course-card-shell:focus-within .course-delete-trigger { opacity: 1; }
+.course-card-shell:focus-within .course-delete-trigger,
+.course-card-shell:hover .course-cover-trigger,
+.course-card-shell:focus-within .course-cover-trigger { opacity: 1; }
 .course-delete-trigger:hover { background: var(--oxblood-dark); }
+.course-cover-trigger:hover,
+.course-cover-trigger[aria-expanded="true"] { background: var(--teal); opacity: 1; }
 
 .course-tone-1 { --cover: var(--teal); }
 .course-tone-2 { --cover: var(--mustard); --cover-ink: var(--walnut); }
 .course-tone-3 { --cover: var(--coral); }
+.course-tone-4 { --cover: var(--indigo); }
+.course-tone-5 { --cover: var(--plum); }
+.course-tone-6 { --cover: var(--moss); }
+.course-tone-7 { --cover: var(--slate); }
+
+/* Cover materials. Each derives from the host's --cover tone; organic
+   textures paint on ::before so the title, spine, and page edge stay
+   crisp. Must come after .course-card so the material background wins. */
+.cover-dye {
+  background:
+    repeating-linear-gradient(0deg, rgba(43, 37, 31, 0.06) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(90deg, rgba(43, 37, 31, 0.06) 0 1px, transparent 1px 3px),
+    color-mix(in srgb, var(--cover) 80%, #27356b);
+}
+
+.cover-dye::before {
+  content: "";
+  position: absolute;
+  inset: -22px;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 82% 34%, rgba(255, 250, 238, 0.14) 0 46px, transparent 105px),
+    radial-gradient(circle at 82% 34%,
+      rgba(255, 250, 238, 0.5) 0 6px, transparent 8px,
+      transparent 24px, rgba(255, 250, 238, 0.52) 25px 30px, transparent 33px,
+      transparent 50px, rgba(255, 250, 238, 0.44) 51px 56px, transparent 60px,
+      transparent 78px, rgba(255, 250, 238, 0.34) 79px 84px, transparent 89px,
+      transparent 107px, rgba(255, 250, 238, 0.22) 108px 113px, transparent 119px),
+    radial-gradient(circle at 20% 90%, rgba(163, 189, 235, 0.14) 0 34px, transparent 80px),
+    radial-gradient(circle at 20% 90%,
+      rgba(163, 189, 235, 0.5) 0 5px, transparent 7px,
+      transparent 20px, rgba(163, 189, 235, 0.5) 21px 25px, transparent 28px,
+      transparent 42px, rgba(163, 189, 235, 0.4) 43px 47px, transparent 51px,
+      transparent 66px, rgba(163, 189, 235, 0.26) 67px 71px, transparent 76px),
+    radial-gradient(circle at 102% 96%,
+      transparent 16px, rgba(233, 150, 136, 0.5) 17px 21px, transparent 24px,
+      transparent 37px, rgba(233, 150, 136, 0.38) 38px 42px, transparent 46px,
+      transparent 60px, rgba(233, 150, 136, 0.26) 61px 65px, transparent 70px),
+    radial-gradient(circle at -3% 6%,
+      transparent 20px, rgba(235, 198, 118, 0.46) 21px 25px, transparent 28px,
+      transparent 44px, rgba(235, 198, 118, 0.32) 45px 49px, transparent 54px);
+  filter: url(#cover-dye-warp);
+}
+
+.cover-mosaic {
+  background:
+    repeating-linear-gradient(0deg, rgba(30, 24, 18, 0.42) 0 2px, transparent 2px 28px),
+    repeating-linear-gradient(90deg, rgba(30, 24, 18, 0.42) 0 2px, transparent 2px 28px),
+    url("data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%22224%22%20height=%22224%22%3E%3Crect%20x=%220%22%20y=%222%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%2226%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%2230%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%2254%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%2258%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%2282%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%2286%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22110%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22114%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22138%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22142%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22166%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22170%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22194%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22198%22%20width=%22224%22%20height=%222%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%220%22%20y=%22222%22%20width=%22224%22%20height=%222%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%222%22%20y=%222%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%2230%22%20y=%222%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.05%22/%3E%3Crect%20x=%2286%22%20y=%222%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.08%22/%3E%3Crect%20x=%22142%22%20y=%222%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.13%22/%3E%3Crect%20x=%22198%22%20y=%222%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.05%22/%3E%3Crect%20x=%2230%22%20y=%2230%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.06%22/%3E%3Crect%20x=%2258%22%20y=%2230%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.1%22/%3E%3Crect%20x=%22114%22%20y=%2230%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.11%22/%3E%3Crect%20x=%22170%22%20y=%2230%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.11%22/%3E%3Crect%20x=%222%22%20y=%2258%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.16%22/%3E%3Crect%20x=%2258%22%20y=%2258%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.13%22/%3E%3Crect%20x=%2286%22%20y=%2258%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%22142%22%20y=%2258%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.14%22/%3E%3Crect%20x=%22170%22%20y=%2258%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.11%22/%3E%3Crect%20x=%22198%22%20y=%2258%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%222%22%20y=%2286%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.06%22/%3E%3Crect%20x=%2230%22%20y=%2286%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.11%22/%3E%3Crect%20x=%2286%22%20y=%2286%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.06%22/%3E%3Crect%20x=%22114%22%20y=%2286%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.05%22/%3E%3Crect%20x=%22170%22%20y=%2286%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.14%22/%3E%3Crect%20x=%222%22%20y=%22114%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.09%22/%3E%3Crect%20x=%2258%22%20y=%22114%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%22114%22%20y=%22114%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.07%22/%3E%3Crect%20x=%22142%22%20y=%22114%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%22170%22%20y=%22114%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.11%22/%3E%3Crect%20x=%22198%22%20y=%22114%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.08%22/%3E%3Crect%20x=%222%22%20y=%22142%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.12%22/%3E%3Crect%20x=%2230%22%20y=%22142%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.15%22/%3E%3Crect%20x=%2286%22%20y=%22142%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.13%22/%3E%3Crect%20x=%22114%22%20y=%22142%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.12%22/%3E%3Crect%20x=%22170%22%20y=%22142%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.07%22/%3E%3Crect%20x=%22198%22%20y=%22142%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.1%22/%3E%3Crect%20x=%222%22%20y=%22170%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.14%22/%3E%3Crect%20x=%2230%22%20y=%22170%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.09%22/%3E%3Crect%20x=%2258%22%20y=%22170%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.13%22/%3E%3Crect%20x=%22114%22%20y=%22170%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.13%22/%3E%3Crect%20x=%22142%22%20y=%22170%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.1%22/%3E%3Crect%20x=%22170%22%20y=%22170%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.06%22/%3E%3Crect%20x=%222%22%20y=%22198%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.11%22/%3E%3Crect%20x=%2258%22%20y=%22198%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.07%22/%3E%3Crect%20x=%2286%22%20y=%22198%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.11%22/%3E%3Crect%20x=%22142%22%20y=%22198%22%20width=%2226%22%20height=%2226%22%20fill=%22black%22%20opacity=%220.07%22/%3E%3Crect%20x=%22198%22%20y=%22198%22%20width=%2226%22%20height=%2226%22%20fill=%22white%22%20opacity=%220.15%22/%3E%3C/svg%3E"),
+    var(--cover);
+}
+
+.cover-wood {
+  background:
+    linear-gradient(90deg, rgba(255, 244, 224, 0.1), transparent 26%, rgba(38, 22, 10, 0.12) 88%),
+    color-mix(in srgb, var(--cover) 72%, #7c5a33);
+}
+
+.cover-wood::before {
+  content: "";
+  position: absolute;
+  inset: -24px;
+  pointer-events: none;
+  background:
+    repeating-radial-gradient(ellipse 46px 130px at 74% 26%, rgba(38, 22, 10, 0.2) 0 2px, transparent 2px 12px),
+    repeating-linear-gradient(90deg,
+      rgba(38, 22, 10, 0.26) 0 1px, transparent 1px 8px,
+      rgba(38, 22, 10, 0.16) 8px 10px, transparent 10px 26px,
+      rgba(255, 238, 214, 0.12) 26px 27px, transparent 27px 43px),
+    repeating-linear-gradient(90deg, rgba(38, 22, 10, 0.09) 0 3px, transparent 3px 17px);
+  filter: url(#cover-wood-warp);
+}
+
+.cover-marble {
+  background: color-mix(in srgb, var(--cover) 86%, var(--paper));
+}
+
+.cover-marble::before {
+  content: "";
+  position: absolute;
+  inset: -52px;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 150% 60% at 26% 8%, color-mix(in srgb, var(--cover) 82%, transparent) 0 30%, transparent 64%),
+    repeating-linear-gradient(112deg,
+      rgba(247, 240, 227, 0.42) 0 6px, transparent 6px 27px,
+      rgba(43, 37, 31, 0.26) 27px 31px, transparent 31px 55px,
+      rgba(235, 198, 118, 0.34) 55px 59px, transparent 59px 92px,
+      rgba(247, 240, 227, 0.36) 92px 99px, transparent 99px 132px),
+    repeating-linear-gradient(98deg, rgba(255, 255, 255, 0.12) 0 2px, transparent 2px 11px);
+}
+
+.cover-diffusion {
+  --cover-ink: #fffaf0;
+  background: color-mix(in srgb, var(--cover) 78%, #1b1e33);
+}
+
+.cover-diffusion::before {
+  content: "";
+  position: absolute;
+  inset: -30px;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 78% 24%, rgba(255, 172, 120, 0.5), transparent 55%),
+    radial-gradient(circle at 22% 52%, rgba(150, 122, 255, 0.4), transparent 50%),
+    radial-gradient(circle at 88% 78%, rgba(96, 198, 255, 0.42), transparent 48%),
+    radial-gradient(circle at 34% 98%, rgba(255, 124, 152, 0.36), transparent 50%);
+  filter: blur(22px) saturate(1.15);
+}
+
+/* Pin filtered covers to their own compositing layer so repaints
+   elsewhere on the shelf (e.g. hovering a neighbouring card) cannot
+   re-rasterize the texture and make it swim. Hovering the card itself
+   releases the layer, keeping the live re-render wobble there. */
+.cover-dye,
+.cover-wood,
+.cover-diffusion {
+  will-change: transform;
+}
+
+.course-card-shell:hover .cover-dye,
+.course-card-shell:hover .cover-wood,
+.course-card-shell:hover .cover-diffusion {
+  will-change: auto;
+}
+
+/* Mirror the hand-made textures per cover tone so cards
+   don't repeat identically across the shelf. */
+:is(.course-tone-1, .course-tone-4):is(.cover-dye, .cover-wood, .cover-diffusion)::before { transform: scaleX(-1); }
+:is(.course-tone-2, .course-tone-5):is(.cover-dye, .cover-wood, .cover-diffusion)::before { transform: scaleY(-1); }
+:is(.course-tone-3, .course-tone-6):is(.cover-dye, .cover-wood, .cover-diffusion)::before { transform: scale(-1); }
 
 .course-card-broken {
   --cover: #6b6258;
@@ -223,6 +431,14 @@ button:disabled { cursor: not-allowed; }
   width: 1px;
   background: rgba(255,255,255,0.28);
   box-shadow: 5px 0 rgba(0,0,0,0.08);
+}
+
+/* Keep cover text above the absolutely-positioned ::before textures. */
+.course-card strong,
+.course-card small,
+.course-card .course-open {
+  position: relative;
+  z-index: 1;
 }
 
 .course-card strong {
@@ -686,21 +902,17 @@ body.panel-resizing #lesson-frame { pointer-events: none; }
   padding: 0 4px 14px;
 }
 
-.brand strong { font-size: 18px; }
-.brand .brand-mark { width: 34px; height: 34px; font-size: 18px; }
-
-.back-to-library {
+.brand-home {
   align-self: flex-start;
-  margin: 2px 2px 12px;
-  padding: 4px 3px;
   border: 0;
   background: transparent;
-  color: var(--oxblood);
-  font-size: 10px;
-  font-weight: 700;
+  text-align: left;
 }
 
-.back-to-library:hover { text-decoration: underline; }
+.brand-home:hover strong { color: var(--oxblood); }
+
+.brand strong { font-size: 18px; }
+.brand .brand-mark { width: 34px; height: 34px; font-size: 18px; }
 
 .current-course-title {
   display: -webkit-box;
