@@ -31,6 +31,11 @@
         <feTurbulence type="fractalNoise" baseFrequency="0.006 0.028" numOctaves="2" seed="11" result="noise"/>
         <feDisplacementMap in="SourceGraphic" in2="noise" scale="18" xChannelSelector="R" yChannelSelector="G"/>
       </filter>
+      <filter id="cover-marble-warp" x="-30%" y="-30%" width="160%" height="160%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.011 0.019" numOctaves="3" seed="4" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="90" xChannelSelector="R" yChannelSelector="G"/>
+        <feGaussianBlur stdDeviation="0.3"/>
+      </filter>
     </defs>
   </svg>
 

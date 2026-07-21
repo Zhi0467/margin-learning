@@ -372,6 +372,7 @@ button:disabled { cursor: not-allowed; }
       rgba(235, 198, 118, 0.34) 55px 59px, transparent 59px 92px,
       rgba(247, 240, 227, 0.36) 92px 99px, transparent 99px 132px),
     repeating-linear-gradient(98deg, rgba(255, 255, 255, 0.12) 0 2px, transparent 2px 11px);
+  filter: url(#cover-marble-warp);
 }
 
 .cover-diffusion {
